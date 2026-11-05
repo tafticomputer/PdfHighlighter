@@ -1,0 +1,33 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.example.pdfhighlighter'
+    compileSdk 33
+
+    defaultConfig {
+        applicationId 'com.example.pdfhighlighter'
+        minSdk 21          // اندروید 5.0 و 5.1
+        targetSdk 33
+        versionCode 1
+        versionName '1.0'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+        encoding = 'UTF-8'
+    }
+}
+
+// این پروژه عمداً هیچ کتابخانه‌ی خارجی ندارد:
+// نمایش PDF با android.graphics.pdf.PdfRenderer (جزو خود اندروید از نسخه 5.0)
+dependencies {
+}
