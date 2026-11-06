@@ -3,36 +3,28 @@ package com.example.pdfhighlighter;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
-import android.content.Context;
 import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.SharedPreferences;
-import android.content.res.Configuration;
 import android.database.Cursor;
-import android.graphics.Bitmap;
 import android.graphics.Color;
-import android.graphics.drawable.ColorDrawable;
+import android.graphics.drawable.GradientDrawable;
 import android.graphics.pdf.PdfRenderer;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
 import android.text.InputType;
-import android.util.LruCache;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.Menu;
 import android.view.MenuItem;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.AbsListView;
-import android.widget.BaseAdapter;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
-import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
-import android.widget.ListView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -42,40 +34,35 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.Map;
 import java.util.TreeMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 
-public class MainActivity extends Activity implements PageView.Listener {
+public class MainActivity extends Activity implements PdfView.Listener {
 
     private static final int REQ_OPEN = 1;
-    private static final int[] COLORS = {0xFFFFEB3B, 0xFF69F0AE, 0xFFFF80AB, 0xFF80D8FF, 0xFFFFAB40};
-    private static final String[] COLOR_NAMES = {"زرد", "سبز", "صورتی", "آبی", "نارنجی"};
-    private static final int MAX_RENDER_WIDTH = 1600;
 
-    private final Object lock = new Object();
-    private final ExecutorService exec = Executors.newSingleThreadExecutor();
+    private static final int[] HL_COLORS = {0xFFFFEB3B, 0xFF69F0AE, 0xFFFF80AB, 0xFF80D8FF, 0xFFFFAB40};
+    private static final int[] PEN_COLORS = {0xFF212121, 0xFFE53935, 0xFF1E88E5, 0xFF43A047, 0xFFFB8C00};
+    private static final float[] HL_W = {0.022f, 0.034f, 0.05f};
+    private static final float[] PEN_W = {0.0035f, 0.007f, 0.012f};
+    private static final String[] SIZE_NAMES = {"باریک", "متوسط", "ضخیم"};
 
-    private PdfRenderer renderer;
-    private File currentFile;
-    private float[] pageW = new float[0];
-    private float[] pageH = new float[0];
-    private int pageCount = 0;
-    private volatile int generation = 0;
-    private LruCache<String, Bitmap> cache;
-
-    private HighlightStore store;
-    private String docKey;
-    private int mode = PageView.MODE_VIEW;
-    private int colorIndex = 0;
-    private float zoom = 1f;
-    private boolean hintShown = false;
-
-    private SharedPreferences prefs;
-    private HorizontalScrollView hsv;
-    private ListView listView;
+    private PdfView pdfView;
     private TextView indicator;
     private LinearLayout emptyView;
-    private PageAdapter adapter;
+    private LinearLayout toolbar;
+    private LinearLayout colorRow;
+    private TextView btnHand, btnHl, btnPen, btnErase, btnUndo, btnSize;
+    private final View[] dots = new View[5];
+
+    private SharedPreferences prefs;
+    private HighlightStore store;
+    private String docKey;
+    private File currentFile;
+    private int pageCount = 0;
+
+    private int tool = PdfView.TOOL_HAND;
+    private int hlColor, penColor, hlSize, penSize;
+    private boolean straighten;
+    private boolean hintShown;
 
     // ------------------------------------------------------------------ چرخه‌ی عمر
 
@@ -83,14 +70,16 @@ public class MainActivity extends Activity implements PageView.Listener {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("app", MODE_PRIVATE);
-        int mem = (int) (Runtime.getRuntime().maxMemory() / 6);
-        cache = new LruCache<String, Bitmap>(Math.max(mem, 4 * 1024 * 1024)) {
-            @Override
-            protected int sizeOf(String key, Bitmap value) {
-                return value.getByteCount();
-            }
-        };
+        hlColor = prefs.getInt("hl_color", 0);
+        penColor = prefs.getInt("pen_color", 0);
+        hlSize = prefs.getInt("hl_size", 1);
+        penSize = prefs.getInt("pen_size", 1);
+        straighten = prefs.getBoolean("straighten", true);
+        hintShown = prefs.getBoolean("hint_shown", false);
         buildUi();
+        pdfView.setStraighten(straighten);
+        applyBrush();
+        updateToolbar();
         handleIntent(getIntent(), true);
     }
 
@@ -120,37 +109,22 @@ public class MainActivity extends Activity implements PageView.Listener {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        exec.shutdownNow();
-        synchronized (lock) {
-            if (renderer != null) {
-                try {
-                    renderer.close();
-                } catch (Throwable ignored) {
-                }
-                renderer = null;
-            }
-        }
-    }
-
-    @Override
-    public void onConfigurationChanged(Configuration newConfig) {
-        super.onConfigurationChanged(newConfig);
-        if (pageCount > 0) {
-            int first = listView.getFirstVisiblePosition();
-            applyZoomLayout();
-            adapter.notifyDataSetChanged();
-            listView.setSelection(first);
-        }
+        pdfView.release();
+        if (currentFile != null) currentFile.delete();
     }
 
     @Override
     public void onBackPressed() {
-        if (mode != PageView.MODE_VIEW) {
-            mode = PageView.MODE_VIEW;
-            applyMode();
+        if (tool != PdfView.TOOL_HAND) {
+            setTool(PdfView.TOOL_HAND);
         } else {
             super.onBackPressed();
         }
+    }
+
+    @Override
+    public void onPageChanged(int page, int count) {
+        indicator.setText("صفحه " + (page + 1) + " از " + count);
     }
 
     // ------------------------------------------------------------------ رابط کاربری
@@ -159,37 +133,16 @@ public class MainActivity extends Activity implements PageView.Listener {
         return (int) TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, getResources().getDisplayMetrics());
     }
 
-    private int pageWidth() {
-        return Math.max(1, (int) (getResources().getDisplayMetrics().widthPixels * zoom));
-    }
-
     private void buildUi() {
-        FrameLayout root = new FrameLayout(this);
-        root.setBackgroundColor(0xFF757575);
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
 
-        hsv = new HorizontalScrollView(this);
-        hsv.setFillViewport(true);
+        FrameLayout content = new FrameLayout(this);
+        content.setBackgroundColor(0xFF757575);
 
-        listView = new ListView(this);
-        listView.setDivider(new ColorDrawable(0xFF757575));
-        listView.setDividerHeight(dp(8));
-        listView.setCacheColorHint(Color.TRANSPARENT);
-        listView.setSelector(new ColorDrawable(Color.TRANSPARENT));
-        adapter = new PageAdapter();
-        listView.setAdapter(adapter);
-        listView.setOnScrollListener(new AbsListView.OnScrollListener() {
-            @Override
-            public void onScrollStateChanged(AbsListView view, int scrollState) {
-            }
-
-            @Override
-            public void onScroll(AbsListView view, int firstVisibleItem, int visibleItemCount, int totalItemCount) {
-                updateIndicator();
-            }
-        });
-        hsv.addView(listView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        root.addView(hsv, new FrameLayout.LayoutParams(
+        pdfView = new PdfView(this);
+        pdfView.setListener(this);
+        content.addView(pdfView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         indicator = new TextView(this);
@@ -199,9 +152,9 @@ public class MainActivity extends Activity implements PageView.Listener {
         indicator.setVisibility(View.GONE);
         FrameLayout.LayoutParams ilp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-        ilp.bottomMargin = dp(16);
-        root.addView(indicator, ilp);
+                Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        ilp.topMargin = dp(8);
+        content.addView(indicator, ilp);
 
         emptyView = new LinearLayout(this);
         emptyView.setOrientation(LinearLayout.VERTICAL);
@@ -221,35 +174,195 @@ public class MainActivity extends Activity implements PageView.Listener {
             }
         });
         emptyView.addView(btn);
-        root.addView(emptyView, new FrameLayout.LayoutParams(
+        content.addView(emptyView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.CENTER));
 
+        root.addView(content, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // ---- نوار ابزار پایین
+        toolbar = new LinearLayout(this);
+        toolbar.setOrientation(LinearLayout.VERTICAL);
+        toolbar.setBackgroundColor(0xFFFAFAFA);
+        toolbar.setPadding(dp(4), dp(4), dp(4), dp(4));
+        toolbar.setVisibility(View.GONE);
+
+        colorRow = new LinearLayout(this);
+        colorRow.setOrientation(LinearLayout.HORIZONTAL);
+        colorRow.setGravity(Gravity.CENTER);
+        for (int i = 0; i < 5; i++) {
+            final int idx = i;
+            View d = new View(this);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(34), dp(34));
+            lp.setMargins(dp(6), dp(2), dp(6), dp(6));
+            d.setOnClickListener(new View.OnClickListener() {
+                @Override
+                public void onClick(View v) {
+                    pickColor(idx);
+                }
+            });
+            colorRow.addView(d, lp);
+            dots[i] = d;
+        }
+        btnSize = makeButton("ضخامت", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                cycleSize();
+            }
+        });
+        colorRow.addView(btnSize, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)));
+        toolbar.addView(colorRow);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        btnHand = makeButton("دست", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                setTool(PdfView.TOOL_HAND);
+            }
+        });
+        btnHl = makeButton("هایلایت", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                toggleTool(PdfView.TOOL_HIGHLIGHT);
+            }
+        });
+        btnPen = makeButton("قلم", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                toggleTool(PdfView.TOOL_PEN);
+            }
+        });
+        btnErase = makeButton("پاک‌کن", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                toggleTool(PdfView.TOOL_ERASE);
+            }
+        });
+        btnUndo = makeButton("برگشت", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                if (pdfView.undo() == null) toast("چیزی برای برگرداندن نیست");
+            }
+        });
+        TextView[] all = {btnHand, btnHl, btnPen, btnErase, btnUndo};
+        for (TextView b : all) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(44), 1f);
+            lp.setMargins(dp(3), 0, dp(3), 0);
+            row.addView(b, lp);
+        }
+        toolbar.addView(row);
+
+        root.addView(toolbar, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         setContentView(root);
     }
 
-    private void applyZoomLayout() {
-        listView.setLayoutParams(new FrameLayout.LayoutParams(pageWidth(), ViewGroup.LayoutParams.MATCH_PARENT));
+    private TextView makeButton(String text, View.OnClickListener l) {
+        TextView b = new TextView(this);
+        b.setText(text);
+        b.setGravity(Gravity.CENTER);
+        b.setTextSize(14);
+        b.setPadding(dp(10), 0, dp(10), 0);
+        b.setClickable(true);
+        b.setOnClickListener(l);
+        styleButton(b, false);
+        return b;
     }
 
-    private void updateIndicator() {
-        if (pageCount == 0 || indicator == null) {
-            return;
-        }
-        int first = listView.getFirstVisiblePosition();
-        String m = "";
-        if (mode == PageView.MODE_HIGHLIGHT) {
-            m = "  •  هایلایت: " + COLOR_NAMES[colorIndex];
-        } else if (mode == PageView.MODE_ERASE) {
-            m = "  •  پاک‌کن";
-        }
-        indicator.setText("صفحه " + (first + 1) + " از " + pageCount + m);
+    private void styleButton(TextView b, boolean active) {
+        GradientDrawable g = new GradientDrawable();
+        g.setCornerRadius(dp(8));
+        g.setColor(active ? 0xFF1976D2 : 0xFFE0E0E0);
+        b.setBackground(g);
+        b.setTextColor(active ? Color.WHITE : 0xFF212121);
     }
 
     private void toast(String s) {
         Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
     }
 
-    // ------------------------------------------------------------------ باز کردن فایل
+    // ------------------------------------------------------------------ ابزارها
+
+    private void toggleTool(int t) {
+        setTool(tool == t ? PdfView.TOOL_HAND : t);
+    }
+
+    private void setTool(int t) {
+        if (pageCount == 0) {
+            toast("ابتدا یک فایل PDF باز کنید");
+            return;
+        }
+        tool = t;
+        applyBrush();
+        updateToolbar();
+        if ((t == PdfView.TOOL_HIGHLIGHT || t == PdfView.TOOL_PEN) && !hintShown) {
+            hintShown = true;
+            prefs.edit().putBoolean("hint_shown", true).apply();
+            Toast.makeText(this,
+                    "با یک انگشت روی متن بکشید. با دو انگشت صفحه را جابه‌جا و زوم کنید.",
+                    Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void applyBrush() {
+        pdfView.setTool(tool);
+        if (tool == PdfView.TOOL_PEN) {
+            pdfView.setBrush(PEN_COLORS[penColor], PEN_W[penSize]);
+        } else {
+            pdfView.setBrush(HL_COLORS[hlColor], HL_W[hlSize]);
+        }
+    }
+
+    private void pickColor(int idx) {
+        if (tool == PdfView.TOOL_PEN) {
+            penColor = idx;
+            prefs.edit().putInt("pen_color", idx).apply();
+        } else {
+            hlColor = idx;
+            prefs.edit().putInt("hl_color", idx).apply();
+        }
+        applyBrush();
+        updateToolbar();
+    }
+
+    private void cycleSize() {
+        if (tool == PdfView.TOOL_PEN) {
+            penSize = (penSize + 1) % 3;
+            prefs.edit().putInt("pen_size", penSize).apply();
+        } else {
+            hlSize = (hlSize + 1) % 3;
+            prefs.edit().putInt("hl_size", hlSize).apply();
+        }
+        applyBrush();
+        updateToolbar();
+    }
+
+    private void updateToolbar() {
+        if (btnHand == null) return;
+        styleButton(btnHand, tool == PdfView.TOOL_HAND);
+        styleButton(btnHl, tool == PdfView.TOOL_HIGHLIGHT);
+        styleButton(btnPen, tool == PdfView.TOOL_PEN);
+        styleButton(btnErase, tool == PdfView.TOOL_ERASE);
+        styleButton(btnUndo, false);
+        boolean brush = tool == PdfView.TOOL_HIGHLIGHT || tool == PdfView.TOOL_PEN;
+        colorRow.setVisibility(brush ? View.VISIBLE : View.GONE);
+        if (!brush) return;
+        int[] palette = (tool == PdfView.TOOL_PEN) ? PEN_COLORS : HL_COLORS;
+        int sel = (tool == PdfView.TOOL_PEN) ? penColor : hlColor;
+        for (int i = 0; i < 5; i++) {
+            GradientDrawable g = new GradientDrawable();
+            g.setShape(GradientDrawable.OVAL);
+            g.setColor(palette[i]);
+            g.setStroke(i == sel ? dp(4) : dp(1), i == sel ? 0xFF1976D2 : 0xFF9E9E9E);
+            dots[i].setBackground(g);
+        }
+        int size = (tool == PdfView.TOOL_PEN) ? penSize : hlSize;
+        btnSize.setText("ضخامت: " + SIZE_NAMES[size]);
+    }
+
+    // ------------------------------------------------------------------ باز و بسته کردن فایل
 
     private void pickPdf() {
         try {
@@ -370,165 +483,50 @@ public class MainActivity extends Activity implements PageView.Listener {
 
     private void onLoaded(Uri uri, String name, File file, PdfRenderer r, float[] w, float[] h) {
         saveScrollPos();
-        generation++;
-        synchronized (lock) {
-            if (renderer != null) {
-                try {
-                    renderer.close();
-                } catch (Throwable ignored) {
-                }
-            }
-            renderer = r;
-        }
-        if (currentFile != null) currentFile.delete();
-        currentFile = file;
-        cache.evictAll();
-
-        pageW = w;
-        pageH = h;
-        pageCount = w.length;
         docKey = "doc_" + name + "_" + file.length();
         store = new HighlightStore(this, docKey);
-        mode = PageView.MODE_VIEW;
+        pageCount = w.length;
+        int start = Math.min(prefs.getInt("pos_" + docKey, 0), pageCount - 1);
+
+        pdfView.setDocument(r, w, h, store, start);   // فایل قبلی را خودش می‌بندد
+        if (currentFile != null) currentFile.delete();
+        currentFile = file;
+
         setTitle(name);
         prefs.edit().putString("last_uri", uri.toString()).apply();
-
         emptyView.setVisibility(View.GONE);
         indicator.setVisibility(View.VISIBLE);
-        applyZoomLayout();
-        adapter.notifyDataSetChanged();
-        final int pos = Math.min(prefs.getInt("pos_" + docKey, 0), pageCount - 1);
-        listView.post(new Runnable() {
-            @Override
-            public void run() {
-                listView.setSelection(pos);
-                updateIndicator();
-            }
-        });
+        toolbar.setVisibility(View.VISIBLE);
+        tool = PdfView.TOOL_HAND;
+        applyBrush();
+        updateToolbar();
         invalidateOptionsMenu();
-        updateIndicator();
+    }
+
+    /** بستن فایل فعال؛ هایلایت‌ها ذخیره شده‌اند و دفعه‌ی بعد که همین فایل را باز کنید برمی‌گردند. */
+    private void closeDoc() {
+        if (pageCount == 0) return;
+        saveScrollPos();
+        pdfView.closeDocument();
+        if (currentFile != null) {
+            currentFile.delete();
+            currentFile = null;
+        }
+        store = null;
+        docKey = null;
+        pageCount = 0;
+        tool = PdfView.TOOL_HAND;
+        prefs.edit().remove("last_uri").apply();
+        setTitle(R.string.app_name);
+        indicator.setVisibility(View.GONE);
+        toolbar.setVisibility(View.GONE);
+        emptyView.setVisibility(View.VISIBLE);
+        invalidateOptionsMenu();
     }
 
     private void saveScrollPos() {
-        if (docKey != null && pageCount > 0 && listView != null) {
-            prefs.edit().putInt("pos_" + docKey, listView.getFirstVisiblePosition()).apply();
-        }
-    }
-
-    // ------------------------------------------------------------------ رندر صفحه‌ها
-
-    private Bitmap renderPage(int index, int w, int h, int gen) {
-        synchronized (lock) {
-            if (renderer == null || gen != generation) return null;
-            PdfRenderer.Page page = null;
-            try {
-                page = renderer.openPage(index);
-                Bitmap bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
-                bmp.eraseColor(Color.WHITE);
-                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
-                return bmp;
-            } catch (Throwable t) {
-                return null;
-            } finally {
-                if (page != null) {
-                    try {
-                        page.close();
-                    } catch (Throwable ignored) {
-                    }
-                }
-            }
-        }
-    }
-
-    private void loadBitmap(final PageView pv, final int page, int w, int h) {
-        final int rw = Math.max(1, Math.min(w, MAX_RENDER_WIDTH));
-        final int rh = Math.max(1, Math.round(rw * (float) h / w));
-        final int gen = generation;
-        final String key = gen + "_" + page + "_" + rw;
-        pv.setRenderKey(key);
-        Bitmap cached = cache.get(key);
-        if (cached != null) {
-            pv.setBitmap(cached);
-            return;
-        }
-        pv.setBitmap(null);
-        exec.execute(new Runnable() {
-            @Override
-            public void run() {
-                if (gen != generation || !key.equals(pv.getRenderKey())) return;
-                final Bitmap b = renderPage(page, rw, rh, gen);
-                if (b == null) return;
-                cache.put(key, b);
-                runOnUiThread(new Runnable() {
-                    @Override
-                    public void run() {
-                        if (key.equals(pv.getRenderKey())) pv.setBitmap(b);
-                    }
-                });
-            }
-        });
-    }
-
-    private class PageAdapter extends BaseAdapter {
-        @Override
-        public int getCount() {
-            return pageCount;
-        }
-
-        @Override
-        public Object getItem(int position) {
-            return null;
-        }
-
-        @Override
-        public long getItemId(int position) {
-            return position;
-        }
-
-        @Override
-        public View getView(int position, View convertView, ViewGroup parent) {
-            PageView pv = (convertView instanceof PageView) ? (PageView) convertView : new PageView(MainActivity.this);
-            int w = pageWidth();
-            int h = Math.max(1, Math.round(w * pageH[position] / pageW[position]));
-            pv.setLayoutParams(new AbsListView.LayoutParams(w, h));
-            pv.setListener(MainActivity.this);
-            pv.bindPage(position, store.forPage(position), mode, COLORS[colorIndex]);
-            loadBitmap(pv, position, w, h);
-            return pv;
-        }
-    }
-
-    // ------------------------------------------------------------------ هایلایت (PageView.Listener)
-
-    @Override
-    public void onAdd(PageView v, int page, float l, float t, float r, float b) {
-        if (store == null) return;
-        store.add(page, l, t, r, b, COLORS[colorIndex]);
-        v.setHighlights(store.forPage(page));
-    }
-
-    @Override
-    public void onRemove(PageView v, int page, HighlightStore.H h) {
-        if (store == null) return;
-        store.remove(h);
-        v.setHighlights(store.forPage(page));
-    }
-
-    private void applyMode() {
-        for (int i = 0; i < listView.getChildCount(); i++) {
-            View c = listView.getChildAt(i);
-            if (c instanceof PageView) {
-                ((PageView) c).setMode(mode);
-                ((PageView) c).setColor(COLORS[colorIndex]);
-            }
-        }
-        invalidateOptionsMenu();
-        updateIndicator();
-        if (mode == PageView.MODE_HIGHLIGHT && !hintShown) {
-            hintShown = true;
-            Toast.makeText(this,
-                    "انگشت را روی متن بکشید تا هایلایت شود. برای حرکت بین صفحه‌ها، دوباره روی دکمه‌ی هایلایت بزنید.",
-                    Toast.LENGTH_LONG).show();
+        if (docKey != null && pageCount > 0) {
+            prefs.edit().putInt("pos_" + docKey, pdfView.getCurrentPage()).apply();
         }
     }
 
@@ -542,23 +540,16 @@ public class MainActivity extends Activity implements PageView.Listener {
 
     @Override
     public boolean onPrepareOptionsMenu(Menu menu) {
-        MenuItem hi = menu.findItem(R.id.action_highlight);
-        if (hi != null) {
-            hi.setTitle(mode == PageView.MODE_HIGHLIGHT ? "پایان هایلایت" : "هایلایت");
+        boolean has = pageCount > 0;
+        int[] ids = {R.id.action_close, R.id.action_goto, R.id.action_list, R.id.action_fit,
+                R.id.action_straighten, R.id.action_clear};
+        for (int id : ids) {
+            MenuItem it = menu.findItem(id);
+            if (it != null) it.setVisible(has);
         }
-        MenuItem er = menu.findItem(R.id.action_erase);
-        if (er != null) {
-            er.setTitle(mode == PageView.MODE_ERASE ? "پایان پاک‌کن" : "پاک‌کن هایلایت");
-        }
+        MenuItem st = menu.findItem(R.id.action_straighten);
+        if (st != null) st.setChecked(straighten);
         return super.onPrepareOptionsMenu(menu);
-    }
-
-    private boolean needDoc() {
-        if (pageCount == 0 || store == null) {
-            toast("ابتدا یک فایل PDF باز کنید");
-            return false;
-        }
-        return true;
     }
 
     @Override
@@ -568,50 +559,8 @@ public class MainActivity extends Activity implements PageView.Listener {
             pickPdf();
             return true;
         }
-        if (id == R.id.action_highlight) {
-            if (!needDoc()) return true;
-            mode = (mode == PageView.MODE_HIGHLIGHT) ? PageView.MODE_VIEW : PageView.MODE_HIGHLIGHT;
-            applyMode();
-            return true;
-        }
-        if (id == R.id.action_erase) {
-            if (!needDoc()) return true;
-            mode = (mode == PageView.MODE_ERASE) ? PageView.MODE_VIEW : PageView.MODE_ERASE;
-            applyMode();
-            if (mode == PageView.MODE_ERASE) toast("روی هایلایت بزنید تا پاک شود");
-            return true;
-        }
-        if (id == R.id.action_color) {
-            new AlertDialog.Builder(this)
-                    .setTitle("رنگ هایلایت")
-                    .setItems(COLOR_NAMES, new DialogInterface.OnClickListener() {
-                        @Override
-                        public void onClick(DialogInterface dialog, int which) {
-                            colorIndex = which;
-                            if (pageCount > 0) mode = PageView.MODE_HIGHLIGHT;
-                            applyMode();
-                        }
-                    })
-                    .show();
-            return true;
-        }
-        if (id == R.id.action_undo) {
-            if (!needDoc()) return true;
-            HighlightStore.H h = store.removeLast();
-            if (h == null) {
-                toast("هایلایتی برای برگرداندن نیست");
-            } else {
-                adapter.notifyDataSetChanged();
-                listView.setSelection(h.page);
-            }
-            return true;
-        }
-        if (id == R.id.action_zoom_in) {
-            changeZoom(0.5f);
-            return true;
-        }
-        if (id == R.id.action_zoom_out) {
-            changeZoom(-0.5f);
+        if (id == R.id.action_close) {
+            closeDoc();
             return true;
         }
         if (id == R.id.action_goto) {
@@ -622,6 +571,17 @@ public class MainActivity extends Activity implements PageView.Listener {
             showHighlightList();
             return true;
         }
+        if (id == R.id.action_fit) {
+            pdfView.resetZoom();
+            return true;
+        }
+        if (id == R.id.action_straighten) {
+            straighten = !straighten;
+            item.setChecked(straighten);
+            prefs.edit().putBoolean("straighten", straighten).apply();
+            pdfView.setStraighten(straighten);
+            return true;
+        }
         if (id == R.id.action_clear) {
             confirmClear();
             return true;
@@ -629,20 +589,8 @@ public class MainActivity extends Activity implements PageView.Listener {
         return super.onOptionsItemSelected(item);
     }
 
-    private void changeZoom(float delta) {
-        if (!needDoc()) return;
-        float nz = Math.max(1f, Math.min(2.5f, zoom + delta));
-        if (nz == zoom) return;
-        zoom = nz;
-        int first = listView.getFirstVisiblePosition();
-        applyZoomLayout();
-        adapter.notifyDataSetChanged();
-        listView.setSelection(first);
-        toast("بزرگ‌نمایی: " + Math.round(zoom * 100) + "٪");
-    }
-
     private void showGoto() {
-        if (!needDoc()) return;
+        if (pageCount == 0) return;
         final EditText et = new EditText(this);
         et.setInputType(InputType.TYPE_CLASS_NUMBER);
         et.setHint("1 - " + pageCount);
@@ -654,8 +602,7 @@ public class MainActivity extends Activity implements PageView.Listener {
                     public void onClick(DialogInterface dialog, int which) {
                         try {
                             int p = Integer.parseInt(et.getText().toString().trim());
-                            p = Math.max(1, Math.min(pageCount, p));
-                            listView.setSelection(p - 1);
+                            pdfView.goToPage(Math.max(1, Math.min(pageCount, p)) - 1);
                         } catch (NumberFormatException ignored) {
                         }
                     }
@@ -665,14 +612,14 @@ public class MainActivity extends Activity implements PageView.Listener {
     }
 
     private void showHighlightList() {
-        if (!needDoc()) return;
+        if (store == null) return;
         TreeMap<Integer, Integer> counts = new TreeMap<>();
         for (HighlightStore.H h : store.all()) {
             Integer c = counts.get(h.page);
             counts.put(h.page, c == null ? 1 : c + 1);
         }
         if (counts.isEmpty()) {
-            toast("هنوز هایلایتی ندارید");
+            toast("هنوز چیزی ذخیره نشده");
             return;
         }
         final int[] pages = new int[counts.size()];
@@ -680,7 +627,7 @@ public class MainActivity extends Activity implements PageView.Listener {
         int i = 0;
         for (Map.Entry<Integer, Integer> e : counts.entrySet()) {
             pages[i] = e.getKey();
-            labels[i] = "صفحه " + (e.getKey() + 1) + " — " + e.getValue() + " هایلایت";
+            labels[i] = "صفحه " + (e.getKey() + 1) + " — " + e.getValue() + " مورد";
             i++;
         }
         new AlertDialog.Builder(this)
@@ -688,22 +635,22 @@ public class MainActivity extends Activity implements PageView.Listener {
                 .setItems(labels, new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
-                        listView.setSelection(pages[which]);
+                        pdfView.goToPage(pages[which]);
                     }
                 })
                 .show();
     }
 
     private void confirmClear() {
-        if (!needDoc()) return;
+        if (store == null) return;
         new AlertDialog.Builder(this)
                 .setTitle("پاک کردن همه‌ی هایلایت‌ها")
-                .setMessage("همه‌ی هایلایت‌های این فایل حذف شود؟")
+                .setMessage("همه‌ی هایلایت‌ها و نوشته‌های این فایل حذف شود؟")
                 .setPositiveButton("حذف", new DialogInterface.OnClickListener() {
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
                         store.clear();
-                        adapter.notifyDataSetChanged();
+                        pdfView.refreshHighlights();
                     }
                 })
                 .setNegativeButton("لغو", null)

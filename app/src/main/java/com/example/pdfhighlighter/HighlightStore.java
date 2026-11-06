@@ -2,6 +2,7 @@ package com.example.pdfhighlighter;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.util.SparseArray;
 
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -11,21 +12,25 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * ذخیره‌ی هایلایت‌های هر فایل PDF.
- * مختصات هر هایلایت نسبی (بین ۰ و ۱) نسبت به اندازه‌ی صفحه است، پس با زوم و چرخش صفحه هم درست می‌ماند.
- * داده‌ها در SharedPreferences و به‌صورت JSON نگهداری می‌شوند و بعد از بستن برنامه هم می‌مانند.
+ * ذخیره‌ی هایلایت‌ها و نوشته‌های قلم برای هر فایل PDF.
+ * هر خط یک مسیر از نقطه‌هاست که مختصاتش نسبی (بین ۰ و ۱) نسبت به اندازه‌ی صفحه است،
+ * پس با زوم و چرخش صفحه هم در جای درست می‌ماند.
+ * نسخه‌ی قبلی برنامه مستطیل ذخیره می‌کرد؛ آن‌ها هم هنوز خوانده و نمایش داده می‌شوند.
  */
 public class HighlightStore {
 
     public static class H {
         public int page;
-        public float l, t, r, b;
-        public int color;
+        public int color;     // رنگ ARGB
+        public float width;   // ضخامت، به‌صورت کسری از عرض صفحه
+        public float[] pts;   // x0,y0,x1,y1,... (null یعنی مستطیل نسخه‌ی قبلی)
+        public float l, t, r, b; // فقط برای مستطیل نسخه‌ی قبلی
     }
 
     private final SharedPreferences prefs;
     private final String key;
     private final List<H> items = new ArrayList<>();
+    private final SparseArray<List<H>> pageCache = new SparseArray<>();
 
     public HighlightStore(Context ctx, String docKey) {
         prefs = ctx.getSharedPreferences("highlights", Context.MODE_PRIVATE);
@@ -35,6 +40,7 @@ public class HighlightStore {
 
     private void load() {
         items.clear();
+        pageCache.clear();
         String s = prefs.getString(key, null);
         if (s == null) return;
         try {
@@ -43,28 +49,49 @@ public class HighlightStore {
                 JSONObject o = a.getJSONObject(i);
                 H h = new H();
                 h.page = o.getInt("p");
-                h.l = (float) o.getDouble("l");
-                h.t = (float) o.getDouble("t");
-                h.r = (float) o.getDouble("r");
-                h.b = (float) o.getDouble("b");
                 h.color = o.getInt("c");
+                if (o.has("pts")) {
+                    JSONArray pa = o.getJSONArray("pts");
+                    int n = pa.length() - (pa.length() % 2);
+                    h.pts = new float[n];
+                    for (int k = 0; k < n; k++) h.pts[k] = (float) pa.getDouble(k);
+                    h.width = (float) o.getDouble("w");
+                    if (n < 4) continue;
+                } else {
+                    h.l = (float) o.getDouble("l");
+                    h.t = (float) o.getDouble("t");
+                    h.r = (float) o.getDouble("r");
+                    h.b = (float) o.getDouble("b");
+                }
                 items.add(h);
             }
         } catch (JSONException ignored) {
         }
     }
 
+    private static double r4(float v) {
+        return Math.round(v * 10000d) / 10000d;
+    }
+
     private void save() {
+        pageCache.clear();
         JSONArray a = new JSONArray();
         try {
             for (H h : items) {
                 JSONObject o = new JSONObject();
                 o.put("p", h.page);
-                o.put("l", (double) h.l);
-                o.put("t", (double) h.t);
-                o.put("r", (double) h.r);
-                o.put("b", (double) h.b);
                 o.put("c", h.color);
+                if (h.pts != null) {
+                    o.put("w", r4(h.width));
+                    JSONArray pa = new JSONArray();
+                    for (float v : h.pts) pa.put(r4(v));
+                    o.put("pts", pa);
+                } else {
+                    o.put("l", r4(h.l));
+                    o.put("t", r4(h.t));
+                    o.put("r", r4(h.r));
+                    o.put("b", r4(h.b));
+                }
                 a.put(o);
             }
         } catch (JSONException ignored) {
@@ -72,33 +99,35 @@ public class HighlightStore {
         prefs.edit().putString(key, a.toString()).apply();
     }
 
+    /** فهرست موردهای یک صفحه (نباید از بیرون تغییر داده شود). */
     public List<H> forPage(int page) {
-        List<H> out = new ArrayList<>();
-        for (H h : items) {
-            if (h.page == page) out.add(h);
+        List<H> l = pageCache.get(page);
+        if (l == null) {
+            l = new ArrayList<>();
+            for (H h : items) {
+                if (h.page == page) l.add(h);
+            }
+            pageCache.put(page, l);
         }
-        return out;
+        return l;
     }
 
     public List<H> all() {
         return new ArrayList<>(items);
     }
 
-    public void add(int page, float l, float t, float r, float b, int color) {
+    public void add(int page, int color, float width, float[] pts) {
         H h = new H();
         h.page = page;
-        h.l = l;
-        h.t = t;
-        h.r = r;
-        h.b = b;
         h.color = color;
+        h.width = width;
+        h.pts = pts;
         items.add(h);
         save();
     }
 
     public void remove(H h) {
-        items.remove(h);
-        save();
+        if (items.remove(h)) save();
     }
 
     public H removeLast() {

@@ -1,14 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">هایلایت PDF</string>
-    <string name="m_highlight">هایلایت</string>
-    <string name="m_erase">پاک‌کن هایلایت</string>
-    <string name="m_undo">برگرداندن آخرین هایلایت</string>
     <string name="m_open">باز کردن PDF</string>
-    <string name="m_color">رنگ هایلایت</string>
-    <string name="m_zoom_in">بزرگ‌نمایی +</string>
-    <string name="m_zoom_out">کوچک‌نمایی −</string>
+    <string name="m_close">بستن فایل</string>
     <string name="m_goto">رفتن به صفحه</string>
     <string name="m_list">فهرست هایلایت‌ها</string>
+    <string name="m_fit">اندازه‌ی اصلی صفحه</string>
+    <string name="m_straighten">صاف‌کردن خودکار خط هایلایت</string>
     <string name="m_clear">پاک کردن همه هایلایت‌های این فایل</string>
 </resources>

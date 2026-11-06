@@ -1,37 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <menu xmlns:android="http://schemas.android.com/apk/res/android">
     <item
-        android:id="@+id/action_highlight"
-        android:icon="@android:drawable/ic_menu_edit"
+        android:id="@+id/action_close"
+        android:icon="@android:drawable/ic_menu_close_clear_cancel"
         android:showAsAction="always"
-        android:title="@string/m_highlight" />
-    <item
-        android:id="@+id/action_erase"
-        android:icon="@android:drawable/ic_menu_delete"
-        android:showAsAction="ifRoom"
-        android:title="@string/m_erase" />
-    <item
-        android:id="@+id/action_undo"
-        android:icon="@android:drawable/ic_menu_revert"
-        android:showAsAction="ifRoom"
-        android:title="@string/m_undo" />
+        android:title="@string/m_close" />
     <item
         android:id="@+id/action_open"
         android:icon="@android:drawable/ic_menu_add"
         android:showAsAction="ifRoom"
         android:title="@string/m_open" />
-    <item
-        android:id="@+id/action_color"
-        android:showAsAction="never"
-        android:title="@string/m_color" />
-    <item
-        android:id="@+id/action_zoom_in"
-        android:showAsAction="never"
-        android:title="@string/m_zoom_in" />
-    <item
-        android:id="@+id/action_zoom_out"
-        android:showAsAction="never"
-        android:title="@string/m_zoom_out" />
     <item
         android:id="@+id/action_goto"
         android:showAsAction="never"
@@ -40,6 +18,15 @@
         android:id="@+id/action_list"
         android:showAsAction="never"
         android:title="@string/m_list" />
+    <item
+        android:id="@+id/action_fit"
+        android:showAsAction="never"
+        android:title="@string/m_fit" />
+    <item
+        android:id="@+id/action_straighten"
+        android:checkable="true"
+        android:showAsAction="never"
+        android:title="@string/m_straighten" />
     <item
         android:id="@+id/action_clear"
         android:showAsAction="never"
