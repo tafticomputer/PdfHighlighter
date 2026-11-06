@@ -32,12 +32,15 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 
 public class MainActivity extends Activity implements PdfView.Listener {
 
     private static final int REQ_OPEN = 1;
+    private static final int REQ_SAVE_AS = 2;
 
     private static final int[] HL_COLORS = {0xFFFFEB3B, 0xFF69F0AE, 0xFFFF80AB, 0xFF80D8FF, 0xFFFFAB40};
     private static final int[] PEN_COLORS = {0xFF212121, 0xFFE53935, 0xFF1E88E5, 0xFF43A047, 0xFFFB8C00};
@@ -58,6 +61,17 @@ public class MainActivity extends Activity implements PdfView.Listener {
     private String docKey;
     private File currentFile;
     private int pageCount = 0;
+
+    // ---- ذخیره داخل PDF
+    private Uri currentUri;
+    private String currentName;
+    private volatile boolean saving;
+    private boolean clearStoreOnLoad;
+    private int restorePage = -1;
+    private File pendingOut;
+    private boolean pendingReload;
+    private Runnable pendingAfter;
+    private int pendingPage;
 
     private int tool = PdfView.TOOL_HAND;
     private int hlColor, penColor, hlSize, penSize;
@@ -369,6 +383,9 @@ public class MainActivity extends Activity implements PdfView.Listener {
             Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             i.addCategory(Intent.CATEGORY_OPENABLE);
             i.setType("application/pdf");
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
             startActivityForResult(i, REQ_OPEN);
         } catch (ActivityNotFoundException e) {
             toast("برنامه‌ای برای انتخاب فایل پیدا نشد");
@@ -380,15 +397,57 @@ public class MainActivity extends Activity implements PdfView.Listener {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == REQ_OPEN && resultCode == RESULT_OK && data != null && data.getData() != null) {
             Uri uri = data.getData();
+            persistPermission(uri, data);
+            openUri(uri, false);
+            return;
+        }
+        if (requestCode == REQ_SAVE_AS) {
+            final File out = pendingOut;
+            final boolean reload = pendingReload;
+            final Runnable after = pendingAfter;
+            final int page = pendingPage;
+            pendingOut = null;
+            pendingAfter = null;
+            if (out == null) return;
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                final Uri uri = data.getData();
+                persistPermission(uri, data);
+                new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        final boolean ok = copyToUri(out, uri);
+                        out.delete();
+                        runOnUiThread(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (ok) afterSaved(uri, reload, after, page);
+                                else toast("ذخیره ممکن نشد. هایلایت‌ها داخل برنامه باقی ماندند.");
+                            }
+                        });
+                    }
+                }).start();
+            } else {
+                out.delete();
+                toast("ذخیره لغو شد؛ هایلایت‌ها داخل برنامه باقی ماندند.");
+            }
+        }
+    }
+
+    private void persistPermission(Uri uri, Intent data) {
+        int fl = data.getFlags() & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        try {
+            getContentResolver().takePersistableUriPermission(uri, fl);
+        } catch (Exception e) {
             try {
                 getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
             } catch (Exception ignored) {
             }
-            openUri(uri, false);
         }
     }
 
     private void fail(final boolean silent, final String msg) {
+        clearStoreOnLoad = false;
+        restorePage = -1;
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
@@ -483,10 +542,16 @@ public class MainActivity extends Activity implements PdfView.Listener {
 
     private void onLoaded(Uri uri, String name, File file, PdfRenderer r, float[] w, float[] h) {
         saveScrollPos();
+        if (clearStoreOnLoad && store != null) store.clear();   // هایلایت‌ها حالا داخل خود PDF هستند
+        clearStoreOnLoad = false;
         docKey = "doc_" + name + "_" + file.length();
         store = new HighlightStore(this, docKey);
         pageCount = w.length;
-        int start = Math.min(prefs.getInt("pos_" + docKey, 0), pageCount - 1);
+        currentUri = uri;
+        currentName = name;
+        int start = (restorePage >= 0) ? restorePage : prefs.getInt("pos_" + docKey, 0);
+        restorePage = -1;
+        start = Math.max(0, Math.min(start, pageCount - 1));
 
         pdfView.setDocument(r, w, h, store, start);   // فایل قبلی را خودش می‌بندد
         if (currentFile != null) currentFile.delete();
@@ -514,6 +579,8 @@ public class MainActivity extends Activity implements PdfView.Listener {
         }
         store = null;
         docKey = null;
+        currentUri = null;
+        currentName = null;
         pageCount = 0;
         tool = PdfView.TOOL_HAND;
         prefs.edit().remove("last_uri").apply();
@@ -522,6 +589,129 @@ public class MainActivity extends Activity implements PdfView.Listener {
         toolbar.setVisibility(View.GONE);
         emptyView.setVisibility(View.VISIBLE);
         invalidateOptionsMenu();
+    }
+
+    /**
+     * هایلایت‌ها را به‌صورت حاشیه‌نویسی داخل خود فایل PDF می‌نویسد.
+     * اگر فایل قابل بازنویسی نباشد، محل ذخیره‌ی یک نسخه‌ی جدید پرسیده می‌شود.
+     * after بعد از ذخیره‌ی موفق (یا اگر چیزی برای ذخیره نبود) اجرا می‌شود.
+     */
+    private void saveToPdf(final boolean reload, final Runnable after) {
+        if (store == null || pageCount == 0) {
+            if (after != null) after.run();
+            return;
+        }
+        saveScrollPos();
+        store.flush();
+        final List<HighlightStore.H> strokes = store.all();
+        if (strokes.isEmpty()) {
+            toast("هایلایت جدیدی برای ذخیره نیست");
+            if (after != null) after.run();
+            return;
+        }
+        if (saving) return;
+        saving = true;
+        toast("در حال ذخیره در فایل PDF…");
+        final File src = currentFile;
+        final Uri dest = currentUri;
+        final int page = pdfView.getCurrentPage();
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final File out = new File(getCacheDir(), "out_" + System.currentTimeMillis() + ".pdf");
+                try {
+                    PdfExporter.embed(getApplicationContext(), src, out, strokes);
+                } catch (Throwable t) {
+                    out.delete();
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            saving = false;
+                            Toast.makeText(MainActivity.this,
+                                    "ذخیره در PDF ممکن نشد. هایلایت‌ها داخل برنامه ذخیره‌اند.",
+                                    Toast.LENGTH_LONG).show();
+                        }
+                    });
+                    return;
+                }
+                final boolean wrote = dest != null && copyToUri(out, dest);
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        saving = false;
+                        if (wrote) {
+                            out.delete();
+                            afterSaved(dest, reload, after, page);
+                        } else {
+                            pendingOut = out;
+                            pendingReload = reload;
+                            pendingAfter = after;
+                            pendingPage = page;
+                            startSaveAs();
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    private void afterSaved(Uri dest, boolean reload, Runnable after, int page) {
+        toast("هایلایت‌ها داخل فایل PDF ذخیره شد");
+        if (reload) {
+            clearStoreOnLoad = true;
+            restorePage = page;
+            openUri(dest, false);
+        } else {
+            if (store != null) store.clear();
+            if (after != null) after.run();
+        }
+    }
+
+    private void startSaveAs() {
+        String base = (currentName == null) ? "document" : currentName;
+        if (base.toLowerCase().endsWith(".pdf")) base = base.substring(0, base.length() - 4);
+        try {
+            Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("application/pdf");
+            i.putExtra(Intent.EXTRA_TITLE, base + "_highlighted.pdf");
+            Toast.makeText(this, "این فایل قابل بازنویسی نیست؛ محل ذخیره‌ی نسخه‌ی جدید را انتخاب کنید",
+                    Toast.LENGTH_LONG).show();
+            startActivityForResult(i, REQ_SAVE_AS);
+        } catch (ActivityNotFoundException e) {
+            if (pendingOut != null) pendingOut.delete();
+            pendingOut = null;
+            pendingAfter = null;
+            toast("برنامه‌ای برای انتخاب محل ذخیره پیدا نشد");
+        }
+    }
+
+    private boolean copyToUri(File f, Uri uri) {
+        InputStream in = null;
+        OutputStream os = null;
+        try {
+            os = getContentResolver().openOutputStream(uri, "wt");
+            if (os == null) return false;
+            in = new java.io.FileInputStream(f);
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                os.write(buf, 0, n);
+            }
+            os.flush();
+            return true;
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            try {
+                if (in != null) in.close();
+            } catch (IOException ignored) {
+            }
+            try {
+                if (os != null) os.close();
+            } catch (IOException ignored) {
+            }
+        }
     }
 
     private void saveScrollPos() {
@@ -541,7 +731,7 @@ public class MainActivity extends Activity implements PdfView.Listener {
     @Override
     public boolean onPrepareOptionsMenu(Menu menu) {
         boolean has = pageCount > 0;
-        int[] ids = {R.id.action_close, R.id.action_goto, R.id.action_list, R.id.action_fit,
+        int[] ids = {R.id.action_save, R.id.action_close, R.id.action_goto, R.id.action_list, R.id.action_fit,
                 R.id.action_straighten, R.id.action_clear};
         for (int id : ids) {
             MenuItem it = menu.findItem(id);
@@ -555,12 +745,26 @@ public class MainActivity extends Activity implements PdfView.Listener {
     @Override
     public boolean onOptionsItemSelected(MenuItem item) {
         int id = item.getItemId();
-        if (id == R.id.action_open) {
-            pickPdf();
+        if (id == R.id.action_save) {      // ذخیره‌ی هایلایت‌ها داخل خود PDF
+            saveToPdf(true, null);
             return true;
         }
-        if (id == R.id.action_close) {
-            closeDoc();
+        if (id == R.id.action_open) {      // «+» : اول ذخیره، بعد انتخاب فایل جدید
+            saveToPdf(false, new Runnable() {
+                @Override
+                public void run() {
+                    pickPdf();
+                }
+            });
+            return true;
+        }
+        if (id == R.id.action_close) {     // «−» : اول ذخیره، بعد بستن فایل
+            saveToPdf(false, new Runnable() {
+                @Override
+                public void run() {
+                    closeDoc();
+                }
+            });
             return true;
         }
         if (id == R.id.action_goto) {

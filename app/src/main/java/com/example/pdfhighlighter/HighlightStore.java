@@ -74,6 +74,15 @@ public class HighlightStore {
     }
 
     private void save() {
+        prefs.edit().putString(key, toJson()).apply();
+    }
+
+    /** ذخیره‌ی فوری و قطعی روی حافظه (برای دکمه‌ی «ذخیره»). */
+    public boolean flush() {
+        return prefs.edit().putString(key, toJson()).commit();
+    }
+
+    private String toJson() {
         pageCache.clear();
         JSONArray a = new JSONArray();
         try {
@@ -96,7 +105,7 @@ public class HighlightStore {
             }
         } catch (JSONException ignored) {
         }
-        prefs.edit().putString(key, a.toString()).apply();
+        return a.toString();
     }
 
     /** فهرست موردهای یک صفحه (نباید از بیرون تغییر داده شود). */

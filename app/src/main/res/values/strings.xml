@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">هایلایت PDF</string>
-    <string name="m_open">باز کردن PDF</string>
-    <string name="m_close">بستن فایل</string>
+    <string name="m_save">ذخیره</string>
+    <string name="m_open">+</string>
+    <string name="m_close">−</string>
     <string name="m_goto">رفتن به صفحه</string>
     <string name="m_list">فهرست هایلایت‌ها</string>
     <string name="m_fit">اندازه‌ی اصلی صفحه</string>
