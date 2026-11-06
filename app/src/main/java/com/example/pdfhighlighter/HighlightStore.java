@@ -28,7 +28,8 @@ public class HighlightStore {
     }
 
     private final SharedPreferences prefs;
-    private final String key;
+    private String key;
+    private int mod;
     private final List<H> items = new ArrayList<>();
     private final SparseArray<List<H>> pageCache = new SparseArray<>();
 
@@ -74,7 +75,26 @@ public class HighlightStore {
     }
 
     private void save() {
+        mod++;
         prefs.edit().putString(key, toJson()).apply();
+    }
+
+    /** شماره‌ای که با هر تغییر (افزودن، پاک‌کردن، برگشت) زیاد می‌شود. */
+    public int modCount() {
+        return mod;
+    }
+
+    public void addAll(List<H> list) {
+        items.addAll(list);
+        save();
+    }
+
+    /** کلید ذخیره‌سازی را عوض می‌کند (بعد از اینکه اندازه‌ی فایل با ذخیره در PDF تغییر کرد). */
+    public void rekey(String newKey) {
+        if (newKey.equals(key)) return;
+        prefs.edit().remove(key).apply();
+        key = newKey;
+        flush();
     }
 
     /** ذخیره‌ی فوری و قطعی روی حافظه (برای دکمه‌ی «ذخیره»). */

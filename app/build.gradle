@@ -10,8 +10,8 @@ android {
         applicationId 'com.example.pdfhighlighter'
         minSdk 21          // اندروید 5.0 و 5.1
         targetSdk 33
-        versionCode 4
-        versionName '1.3'
+        versionCode 5
+        versionName '1.4'
     }
 
     buildTypes {
@@ -28,7 +28,6 @@ android {
 }
 
 // نمایش PDF: android.graphics.pdf.PdfRenderer (جزو خود اندروید از نسخه 5.0)
-// نوشتن هایلایت داخل فایل PDF: PdfBox-Android
+// نوشتن هایلایت داخل فایل PDF: کلاس PdfInk (بدون کتابخانه‌ی خارجی)
 dependencies {
-    implementation 'com.tom-roush:pdfbox-android:2.0.27.0'
 }

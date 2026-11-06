@@ -66,12 +66,11 @@ public class MainActivity extends Activity implements PdfView.Listener {
     private Uri currentUri;
     private String currentName;
     private volatile boolean saving;
-    private boolean clearStoreOnLoad;
-    private int restorePage = -1;
+    private int savedMod = -1;      // شماره‌ی تغییرِ هایلایت‌ها در آخرین ذخیره
     private File pendingOut;
-    private boolean pendingReload;
     private Runnable pendingAfter;
-    private int pendingPage;
+    private int pendingMod;
+    private long pendingSize;
 
     private int tool = PdfView.TOOL_HAND;
     private int hlColor, penColor, hlSize, penSize;
@@ -403,9 +402,9 @@ public class MainActivity extends Activity implements PdfView.Listener {
         }
         if (requestCode == REQ_SAVE_AS) {
             final File out = pendingOut;
-            final boolean reload = pendingReload;
             final Runnable after = pendingAfter;
-            final int page = pendingPage;
+            final int mod = pendingMod;
+            final long size = pendingSize;
             pendingOut = null;
             pendingAfter = null;
             if (out == null) return;
@@ -420,8 +419,13 @@ public class MainActivity extends Activity implements PdfView.Listener {
                         runOnUiThread(new Runnable() {
                             @Override
                             public void run() {
-                                if (ok) afterSaved(uri, reload, after, page);
-                                else toast("ذخیره ممکن نشد. هایلایت‌ها داخل برنامه باقی ماندند.");
+                                if (ok) {
+                                    savedMod = mod;
+                                    afterSaved(uri, size, after);
+                                } else {
+                                    toast("نوشتن در فایل ممکن نشد. هایلایت‌ها داخل برنامه باقی ماندند.");
+                                    if (after != null) after.run();
+                                }
                             }
                         });
                     }
@@ -429,6 +433,7 @@ public class MainActivity extends Activity implements PdfView.Listener {
             } else {
                 out.delete();
                 toast("ذخیره لغو شد؛ هایلایت‌ها داخل برنامه باقی ماندند.");
+                if (after != null) after.run();
             }
         }
     }
@@ -446,8 +451,6 @@ public class MainActivity extends Activity implements PdfView.Listener {
     }
 
     private void fail(final boolean silent, final String msg) {
-        clearStoreOnLoad = false;
-        restorePage = -1;
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
@@ -505,6 +508,25 @@ public class MainActivity extends Activity implements PdfView.Listener {
                         fos.close();
                     }
 
+                    // اگر این PDF قبلاً با همین برنامه هایلایت شده، هایلایت‌ها را برمی‌داریم و به‌صورت
+                    // قابل‌ویرایش وارد برنامه می‌کنیم؛ صفحه‌ها از نسخه‌ی تمیز رسم می‌شوند.
+                    long keySize = out.length();
+                    List<HighlightStore.H> imported = null;
+                    if (PdfExporter.containsMarker(out)) {
+                        try {
+                            File stripped = new File(getCacheDir(), "pdf_s_" + System.currentTimeMillis() + ".pdf");
+                            List<HighlightStore.H> list = new java.util.ArrayList<>();
+                            if (PdfExporter.stripAndImport(getApplicationContext(), out, stripped, list)) {
+                                out.delete();
+                                out = stripped;
+                                imported = list;
+                            } else {
+                                stripped.delete();
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+
                     ParcelFileDescriptor pfd = ParcelFileDescriptor.open(out, ParcelFileDescriptor.MODE_READ_ONLY);
                     r = new PdfRenderer(pfd);
                     final int count = r.getPageCount();
@@ -523,10 +545,12 @@ public class MainActivity extends Activity implements PdfView.Listener {
                     final PdfRenderer fr = r;
                     final String fname = name;
                     final File ffile = out;
+                    final long fKeySize = keySize;
+                    final List<HighlightStore.H> fImported = imported;
                     runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
-                            onLoaded(uri, fname, ffile, fr, w, h);
+                            onLoaded(uri, fname, ffile, fr, w, h, fKeySize, fImported);
                         }
                     });
                 } catch (SecurityException e) {
@@ -540,18 +564,19 @@ public class MainActivity extends Activity implements PdfView.Listener {
         }).start();
     }
 
-    private void onLoaded(Uri uri, String name, File file, PdfRenderer r, float[] w, float[] h) {
+    private void onLoaded(Uri uri, String name, File file, PdfRenderer r, float[] w, float[] h,
+                          long keySize, List<HighlightStore.H> imported) {
         saveScrollPos();
-        if (clearStoreOnLoad && store != null) store.clear();   // هایلایت‌ها حالا داخل خود PDF هستند
-        clearStoreOnLoad = false;
-        docKey = "doc_" + name + "_" + file.length();
+        docKey = "doc_" + name + "_" + keySize;
         store = new HighlightStore(this, docKey);
+        boolean wasEmpty = store.all().isEmpty();
+        if (imported != null && wasEmpty) store.addAll(imported);   // هایلایت‌های داخل خود فایل
+        // اگر چیزی تغییر نکرده، دیگر لازم نیست دوباره ذخیره شود
+        savedMod = (store.all().isEmpty() || (imported != null && wasEmpty)) ? store.modCount() : -1;
         pageCount = w.length;
         currentUri = uri;
         currentName = name;
-        int start = (restorePage >= 0) ? restorePage : prefs.getInt("pos_" + docKey, 0);
-        restorePage = -1;
-        start = Math.max(0, Math.min(start, pageCount - 1));
+        int start = Math.max(0, Math.min(prefs.getInt("pos_" + docKey, 0), pageCount - 1));
 
         pdfView.setDocument(r, w, h, store, start);   // فایل قبلی را خودش می‌بندد
         if (currentFile != null) currentFile.delete();
@@ -592,48 +617,51 @@ public class MainActivity extends Activity implements PdfView.Listener {
     }
 
     /**
-     * هایلایت‌ها را به‌صورت حاشیه‌نویسی داخل خود فایل PDF می‌نویسد.
+     * همه‌ی هایلایت‌ها را به‌صورت حاشیه‌نویسی داخل خود فایل PDF می‌نویسد (روی نسخه‌ی تمیز صفحه‌ها،
+     * پس ذخیره‌ی دوباره هیچ‌چیز را دوبار نمی‌نویسد و پاک‌کردن‌ها هم اعمال می‌شود).
      * اگر فایل قابل بازنویسی نباشد، محل ذخیره‌ی یک نسخه‌ی جدید پرسیده می‌شود.
      * after بعد از ذخیره‌ی موفق (یا اگر چیزی برای ذخیره نبود) اجرا می‌شود.
      */
-    private void saveToPdf(final boolean reload, final Runnable after) {
+    private void saveToPdf(final Runnable after) {
         if (store == null || pageCount == 0) {
             if (after != null) after.run();
             return;
         }
-        saveScrollPos();
-        store.flush();
-        final List<HighlightStore.H> strokes = store.all();
-        if (strokes.isEmpty()) {
-            toast("هایلایت جدیدی برای ذخیره نیست");
-            if (after != null) after.run();
+        if (store.modCount() == savedMod) {
+            if (after == null) toast("تغییر جدیدی برای ذخیره نیست");
+            else after.run();
             return;
         }
         if (saving) return;
         saving = true;
+        saveScrollPos();
+        store.flush();
+        final List<HighlightStore.H> strokes = store.all();
+        final int mod = store.modCount();
         toast("در حال ذخیره در فایل PDF…");
         final File src = currentFile;
         final Uri dest = currentUri;
-        final int page = pdfView.getCurrentPage();
         new Thread(new Runnable() {
             @Override
             public void run() {
                 final File out = new File(getCacheDir(), "out_" + System.currentTimeMillis() + ".pdf");
                 try {
                     PdfExporter.embed(getApplicationContext(), src, out, strokes);
-                } catch (Throwable t) {
+                } catch (final Throwable t) {
                     out.delete();
+                    final String err = PdfExporter.describe(t);
                     runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
                             saving = false;
-                            Toast.makeText(MainActivity.this,
-                                    "ذخیره در PDF ممکن نشد. هایلایت‌ها داخل برنامه ذخیره‌اند.",
-                                    Toast.LENGTH_LONG).show();
+                            showSaveError(err);
+                            // هایلایت‌ها داخل برنامه امن‌اند؛ پس «+» و «−» به کار خودشان ادامه می‌دهند
+                            if (after != null) after.run();
                         }
                     });
                     return;
                 }
+                final long size = out.length();
                 final boolean wrote = dest != null && copyToUri(out, dest);
                 runOnUiThread(new Runnable() {
                     @Override
@@ -641,12 +669,13 @@ public class MainActivity extends Activity implements PdfView.Listener {
                         saving = false;
                         if (wrote) {
                             out.delete();
-                            afterSaved(dest, reload, after, page);
+                            savedMod = mod;
+                            afterSaved(dest, size, after);
                         } else {
                             pendingOut = out;
-                            pendingReload = reload;
                             pendingAfter = after;
-                            pendingPage = page;
+                            pendingMod = mod;
+                            pendingSize = size;
                             startSaveAs();
                         }
                     }
@@ -655,16 +684,26 @@ public class MainActivity extends Activity implements PdfView.Listener {
         }).start();
     }
 
-    private void afterSaved(Uri dest, boolean reload, Runnable after, int page) {
-        toast("هایلایت‌ها داخل فایل PDF ذخیره شد");
-        if (reload) {
-            clearStoreOnLoad = true;
-            restorePage = page;
-            openUri(dest, false);
-        } else {
-            if (store != null) store.clear();
-            if (after != null) after.run();
+    private void showSaveError(String err) {
+        new AlertDialog.Builder(this)
+                .setTitle("ذخیره در PDF ممکن نشد")
+                .setMessage("هایلایت‌ها داخل برنامه ذخیره شده‌اند و از بین نمی‌روند.\n\nجزئیات خطا (برای رفع مشکل بفرستید):\n" + err)
+                .setPositiveButton("باشه", null)
+                .show();
+    }
+
+    private void afterSaved(Uri dest, long size, Runnable after) {
+        // کلید ذخیره‌ی هایلایت‌ها را با اندازه‌ی جدید فایل هماهنگ می‌کنیم تا با باز کردن دوباره‌ی فایل گم نشوند
+        if (store != null && currentName != null) {
+            int page = pdfView.getCurrentPage();
+            String nk = "doc_" + currentName + "_" + size;
+            store.rekey(nk);
+            docKey = nk;
+            prefs.edit().putInt("pos_" + nk, page).apply();
         }
+        currentUri = dest;
+        toast("هایلایت‌ها داخل فایل PDF ذخیره شد");
+        if (after != null) after.run();
     }
 
     private void startSaveAs() {
@@ -680,9 +719,11 @@ public class MainActivity extends Activity implements PdfView.Listener {
             startActivityForResult(i, REQ_SAVE_AS);
         } catch (ActivityNotFoundException e) {
             if (pendingOut != null) pendingOut.delete();
+            Runnable after = pendingAfter;
             pendingOut = null;
             pendingAfter = null;
             toast("برنامه‌ای برای انتخاب محل ذخیره پیدا نشد");
+            if (after != null) after.run();
         }
     }
 
@@ -746,11 +787,11 @@ public class MainActivity extends Activity implements PdfView.Listener {
     public boolean onOptionsItemSelected(MenuItem item) {
         int id = item.getItemId();
         if (id == R.id.action_save) {      // ذخیره‌ی هایلایت‌ها داخل خود PDF
-            saveToPdf(true, null);
+            saveToPdf(null);
             return true;
         }
         if (id == R.id.action_open) {      // «+» : اول ذخیره، بعد انتخاب فایل جدید
-            saveToPdf(false, new Runnable() {
+            saveToPdf(new Runnable() {
                 @Override
                 public void run() {
                     pickPdf();
@@ -759,7 +800,7 @@ public class MainActivity extends Activity implements PdfView.Listener {
             return true;
         }
         if (id == R.id.action_close) {     // «−» : اول ذخیره، بعد بستن فایل
-            saveToPdf(false, new Runnable() {
+            saveToPdf(new Runnable() {
                 @Override
                 public void run() {
                     closeDoc();

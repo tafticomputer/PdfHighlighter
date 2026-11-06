@@ -2,29 +2,16 @@ package com.example.pdfhighlighter;
 
 import android.content.Context;
 
-import com.tom_roush.pdfbox.android.PDFBoxResourceLoader;
-import com.tom_roush.pdfbox.cos.COSArray;
-import com.tom_roush.pdfbox.cos.COSDictionary;
-import com.tom_roush.pdfbox.cos.COSFloat;
-import com.tom_roush.pdfbox.cos.COSName;
-import com.tom_roush.pdfbox.pdmodel.PDDocument;
-import com.tom_roush.pdfbox.pdmodel.PDPage;
-import com.tom_roush.pdfbox.pdmodel.PDPageContentStream;
-import com.tom_roush.pdfbox.pdmodel.common.PDRectangle;
-import com.tom_roush.pdfbox.pdmodel.graphics.color.PDColor;
-import com.tom_roush.pdfbox.pdmodel.graphics.color.PDDeviceRGB;
-import com.tom_roush.pdfbox.pdmodel.graphics.state.PDExtendedGraphicsState;
-import com.tom_roush.pdfbox.pdmodel.interactive.annotation.PDAnnotation;
-import com.tom_roush.pdfbox.pdmodel.interactive.annotation.PDAppearanceDictionary;
-import com.tom_roush.pdfbox.pdmodel.interactive.annotation.PDAppearanceStream;
-
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
- * هایلایت‌ها و نوشته‌های قلم را به‌صورت حاشیه‌نویسی «Ink» (برداری و قابل‌حذف) داخل خود فایل PDF می‌نویسد.
- * هر حاشیه‌نویسی یک «ظاهر» (Appearance) هم دارد تا در همه‌ی برنامه‌های PDF (Adobe، Chrome، Drive و ...) دیده شود.
+ * پل بین هایلایت‌های برنامه و نویسنده‌ی PDF (PdfInk).
+ *  - embed: همه‌ی هایلایت‌ها را به‌صورت حاشیه‌نویسی داخل یک نسخه‌ی تمیز از PDF می‌نویسد
+ *  - containsMarker / stripAndImport: هایلایت‌هایی که قبلاً با این برنامه داخل فایل نوشته شده را
+ *    دوباره به‌صورت قابل‌ویرایش وارد برنامه می‌کند و نسخه‌ی تمیز صفحه‌ها را می‌سازد
  */
 public final class PdfExporter {
 
@@ -32,140 +19,58 @@ public final class PdfExporter {
     }
 
     public static void embed(Context ctx, File src, File out, List<HighlightStore.H> strokes) throws IOException {
-        PDFBoxResourceLoader.init(ctx);
-        PDDocument doc = PDDocument.load(src);
-        try {
-            int pages = doc.getNumberOfPages();
-            long stamp = System.currentTimeMillis();
-            int idx = 0;
-            for (HighlightStore.H h : strokes) {
-                if (h.page < 0 || h.page >= pages) continue;
-                addInk(doc, doc.getPage(h.page), h, "pdfhl-" + stamp + "-" + (idx++));
-            }
-            doc.save(out);
-        } finally {
-            doc.close();
+        List<PdfInk.Stroke> list = new ArrayList<>();
+        for (HighlightStore.H h : strokes) {
+            PdfInk.Stroke s = new PdfInk.Stroke();
+            s.page = h.page;
+            s.argb = h.color;
+            s.width = h.width;
+            s.pts = h.pts;
+            s.l = h.l;
+            s.t = h.t;
+            s.r = h.r;
+            s.b = h.b;
+            list.add(s);
         }
+        PdfInk.embed(src, out, list);
     }
 
-    private static void addInk(PDDocument doc, PDPage page, HighlightStore.H h, String name) throws IOException {
-        PDRectangle crop = page.getCropBox();
-        int rot = ((page.getRotation() % 360) + 360) % 360;
-        float x0 = crop.getLowerLeftX();
-        float y0 = crop.getLowerLeftY();
-        float cw = crop.getWidth();
-        float ch = crop.getHeight();
-        // اندازه‌ی صفحه همان‌طور که نمایش داده می‌شود (بعد از چرخش)
-        float wd = (rot == 90 || rot == 270) ? ch : cw;
-        float hd = (rot == 90 || rot == 270) ? cw : ch;
+    /** آیا این فایل هایلایتِ ساخته‌شده با همین برنامه دارد؟ */
+    public static boolean containsMarker(File f) {
+        return PdfInk.containsMarker(f);
+    }
 
-        float[] src;
-        float widthFrac;
-        int argb;
-        if (h.pts == null) {            // مستطیل نسخه‌ی قبلی برنامه → خط ضخیم افقی
-            float my = (h.t + h.b) / 2f;
-            src = new float[]{h.l, my, h.r, my};
-            widthFrac = Math.max(0.005f, (h.b - h.t) * hd / wd);
-            argb = (h.color & 0x00FFFFFF) | 0x70000000;
-        } else {
-            src = h.pts;
-            widthFrac = h.width;
-            argb = h.color;
+    /**
+     * هایلایت‌های این برنامه را از in برمی‌دارد و در out اضافه می‌کند؛ نسخه‌ی بدون آن‌ها را در stripped می‌نویسد.
+     * اگر چیزی برای وارد کردن نبود false برمی‌گرداند.
+     */
+    public static boolean stripAndImport(Context ctx, File in, File stripped, List<HighlightStore.H> out)
+            throws IOException {
+        List<PdfInk.Stroke> list = new ArrayList<>();
+        if (!PdfInk.strip(in, stripped, list)) return false;
+        for (PdfInk.Stroke s : list) {
+            HighlightStore.H h = new HighlightStore.H();
+            h.page = s.page;
+            h.color = s.argb;
+            h.width = s.width;
+            h.pts = s.pts;
+            out.add(h);
         }
-        int n = src.length / 2;
-        if (n < 2) return;
+        return true;
+    }
 
-        float[] px = new float[n];
-        float[] py = new float[n];
-        float minX = Float.MAX_VALUE, minY = Float.MAX_VALUE, maxX = -Float.MAX_VALUE, maxY = -Float.MAX_VALUE;
-        for (int k = 0; k < n; k++) {
-            float u = src[2 * k] * wd;      // مختصات روی صفحه‌ی نمایش‌داده‌شده (مبدأ بالا-چپ)
-            float v = src[2 * k + 1] * hd;
-            float x, y;
-            switch (rot) {
-                case 90:
-                    x = x0 + v;
-                    y = y0 + u;
-                    break;
-                case 180:
-                    x = x0 + cw - u;
-                    y = y0 + v;
-                    break;
-                case 270:
-                    x = x0 + cw - v;
-                    y = y0 + ch - u;
-                    break;
-                default:
-                    x = x0 + u;
-                    y = y0 + ch - v;
-                    break;
-            }
-            px[k] = x;
-            py[k] = y;
-            minX = Math.min(minX, x);
-            maxX = Math.max(maxX, x);
-            minY = Math.min(minY, y);
-            maxY = Math.max(maxY, y);
+    /** متن خطا برای نمایش به کاربر (نوع خطا، پیام و چند خط اول محل خطا). */
+    public static String describe(Throwable t) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(t.getClass().getName());
+        if (t.getMessage() != null) sb.append(": ").append(t.getMessage());
+        StackTraceElement[] st = t.getStackTrace();
+        for (int i = 0; i < Math.min(4, st.length); i++) sb.append("\n  at ").append(st[i]);
+        Throwable c = t.getCause();
+        if (c != null && c != t) {
+            sb.append("\nسبب: ").append(c.getClass().getName());
+            if (c.getMessage() != null) sb.append(": ").append(c.getMessage());
         }
-
-        float lw = Math.max(0.5f, widthFrac * wd);
-        float pad = lw / 2f + 1f;
-        PDRectangle rect = new PDRectangle(minX - pad, minY - pad, (maxX - minX) + 2 * pad, (maxY - minY) + 2 * pad);
-
-        float r = ((argb >> 16) & 0xFF) / 255f;
-        float g = ((argb >> 8) & 0xFF) / 255f;
-        float b = (argb & 0xFF) / 255f;
-        float alpha = ((argb >>> 24) & 0xFF) / 255f;
-
-        // ---- خود حاشیه‌نویسی (Ink)
-        COSDictionary d = new COSDictionary();
-        d.setItem(COSName.TYPE, COSName.ANNOT);
-        d.setName(COSName.SUBTYPE, "Ink");
-        PDAnnotation annot = PDAnnotation.createAnnotation(d);
-        annot.setRectangle(rect);
-        annot.setAnnotationFlags(4); // Print
-        annot.setColor(new PDColor(new float[]{r, g, b}, PDDeviceRGB.INSTANCE));
-        d.setString(COSName.NM, name);
-        d.setFloat(COSName.CA, alpha);
-
-        COSArray stroke = new COSArray();
-        for (int k = 0; k < n; k++) {
-            stroke.add(new COSFloat(px[k]));
-            stroke.add(new COSFloat(py[k]));
-        }
-        COSArray inkList = new COSArray();
-        inkList.add(stroke);
-        d.setItem(COSName.getPDFName("InkList"), inkList);
-
-        COSDictionary bs = new COSDictionary();
-        bs.setFloat(COSName.W, lw);
-        d.setItem(COSName.BS, bs);
-
-        // ---- ظاهر حاشیه‌نویسی تا همه‌ی نمایشگرها آن را رسم کنند
-        PDAppearanceStream ap = new PDAppearanceStream(doc);
-        ap.setBBox(rect);
-        PDExtendedGraphicsState gs = new PDExtendedGraphicsState();
-        gs.setStrokingAlphaConstant(alpha);
-        gs.setNonStrokingAlphaConstant(alpha);
-        PDPageContentStream cs = new PDPageContentStream(doc, ap);
-        try {
-            cs.setGraphicsStateParameters(gs);
-            cs.setStrokingColor(r, g, b);
-            cs.setLineWidth(lw);
-            cs.setLineCapStyle(1);
-            cs.setLineJoinStyle(1);
-            cs.moveTo(px[0], py[0]);
-            for (int k = 1; k < n; k++) cs.lineTo(px[k], py[k]);
-            cs.stroke();
-        } finally {
-            cs.close();
-        }
-        PDAppearanceDictionary apd = new PDAppearanceDictionary();
-        apd.setNormalAppearance(ap);
-        annot.setAppearance(apd);
-
-        List<PDAnnotation> list = page.getAnnotations();
-        list.add(annot);
-        page.setAnnotations(list);
+        return sb.toString();
     }
 }
