@@ -27,4 +27,3 @@ jobs:
         with:
           name: PdfHighlighter-apk
           path: app/build/outputs/apk/debug/*.apk
-
