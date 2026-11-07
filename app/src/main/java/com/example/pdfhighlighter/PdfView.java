@@ -816,11 +816,72 @@ public class PdfView extends View {
         drawing = false;
         if (curN >= 2 && store != null) {
             float[] pts = Arrays.copyOf(curPts, curN * 2);
-            if (straighten && curTool == TOOL_HIGHLIGHT) pts = straightened(pts, curN);
-            store.add(strokePage, curArgb, curWidth, pts);
+            float width = curWidth;
+            if (straighten && curTool == TOOL_HIGHLIGHT) {
+                float[] sn = snapToText(pts, curN);     // چسباندن به خط و کلمه‌های متن (مثل OneDrive)
+                if (sn != null) {
+                    pts = sn;
+                    width = snapWidth;
+                } else {
+                    pts = straightened(pts, curN);      // متنی پیدا نشد: فقط خط را صاف کن
+                }
+            }
+            store.add(strokePage, curArgb, width, pts);
         }
         curN = 0;
         invalidate();
+    }
+
+    private float snapWidth;
+
+    /**
+     * هایلایتِ تقریبی را روی خط متنِ زیرش می‌نشاند: ارتفاع دقیق خط، شروع و پایان روی لبه‌ی کلمه‌ها.
+     * متن از روی تصویر صفحه تشخیص داده می‌شود. اگر نشد (تصویر هنوز آماده نیست، خط روی عکس است، چند خط
+     * را یک‌جا کشیده‌اند) null برمی‌گرداند.
+     */
+    private float[] snapToText(float[] pts, int n) {
+        Bitmap b = baseCache.get(baseKey(strokePage));
+        if (b == null || b.isRecycled()) return null;
+        int bw = b.getWidth();
+        int bh = b.getHeight();
+        float minX = 1f, maxX = 0f, minY = 1f, maxY = 0f, sumY = 0f;
+        for (int k = 0; k < n; k++) {
+            float x = pts[2 * k], y = pts[2 * k + 1];
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+            sumY += y;
+        }
+        if ((maxY - minY) * bh > 0.05f * bw) return null;   // چند خط را یک‌جا کشیده‌اند
+        float x0 = minX * bw, x1 = maxX * bw, yc = (sumY / n) * bh;
+        int rx0 = Math.max(0, (int) (x0 - 0.15f * bw));
+        int rx1 = Math.min(bw, (int) (x1 + 0.15f * bw) + 1);
+        int vy = Math.max(60, (int) (0.04f * bh));
+        int ry0 = Math.max(0, (int) yc - vy);
+        int ry1 = Math.min(bh, (int) yc + vy);
+        int rw = rx1 - rx0, rh = ry1 - ry0;
+        if (rw < 8 || rh < 8) return null;
+        int[] px = new int[rw * rh];
+        try {
+            b.getPixels(px, 0, rw, rx0, ry0, rw, rh);
+        } catch (Throwable t) {
+            return null;
+        }
+        TextSnap.Result r = TextSnap.snap(px, rw, rh, x0 - rx0, x1 - rx0, yc - ry0, Math.round(bw * 0.06f));
+        if (r == null) return null;
+        float widthFrac = (r.yBottom - r.yTop) / bw;         // ضخامت = ارتفاع خط، نسبت به عرض صفحه
+        float yMid = ((r.yTop + r.yBottom) / 2f + ry0) / bh;
+        float xs = (r.xMin + rx0) / bw;
+        float xe = (r.xMax + rx0) / bw;
+        float a = xs + widthFrac / 2f;                        // سرِ گرد خط دقیقاً روی لبه‌ی کلمه‌ها تمام شود
+        float e = xe - widthFrac / 2f;
+        if (e <= a) {
+            a = (xs + xe) / 2f - 0.002f;
+            e = (xs + xe) / 2f + 0.002f;
+        }
+        snapWidth = widthFrac;
+        return new float[]{a, yMid, e, yMid};
     }
 
     /** اگر خط تقریباً افقی کشیده شده، آن را به یک خط صاف و تمیز تبدیل می‌کند (مثل انتخاب متن). */
