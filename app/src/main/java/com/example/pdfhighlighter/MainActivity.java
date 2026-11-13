@@ -33,6 +33,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -71,6 +72,11 @@ public class MainActivity extends Activity implements PdfView.Listener {
     private Runnable pendingAfter;
     private int pendingMod;
     private long pendingSize;
+    // حالت «مستقیم»: فایل کپی نمی‌شود؛ هایلایت‌ها به انتهای خود فایل افزوده می‌شوند
+    private boolean direct;
+    private long directLen;
+    private byte[] pendingTail;
+    private List<HighlightStore.H> pendingTodo;
 
     private int tool = PdfView.TOOL_HAND;
     private int hlColor, penColor, hlSize, penSize;
@@ -402,25 +408,35 @@ public class MainActivity extends Activity implements PdfView.Listener {
         }
         if (requestCode == REQ_SAVE_AS) {
             final File out = pendingOut;
+            final byte[] tail = pendingTail;
+            final List<HighlightStore.H> todo = pendingTodo;
+            final Uri srcUri = currentUri;
             final Runnable after = pendingAfter;
             final int mod = pendingMod;
             final long size = pendingSize;
             pendingOut = null;
+            pendingTail = null;
+            pendingTodo = null;
             pendingAfter = null;
-            if (out == null) return;
+            if (out == null && tail == null) return;
             if (resultCode == RESULT_OK && data != null && data.getData() != null) {
                 final Uri uri = data.getData();
                 persistPermission(uri, data);
+                toast("در حال ذخیره…");
                 new Thread(new Runnable() {
                     @Override
                     public void run() {
-                        final boolean ok = copyToUri(out, uri);
-                        out.delete();
+                        final boolean ok = (out != null) ? copyToUri(out, uri) : copyDirectToUri(srcUri, tail, uri);
+                        if (out != null) out.delete();
                         runOnUiThread(new Runnable() {
                             @Override
                             public void run() {
                                 if (ok) {
                                     savedMod = mod;
+                                    if (tail != null && store != null) {
+                                        store.markBaked(todo);
+                                        directLen = size;
+                                    }
                                     afterSaved(uri, size, after);
                                 } else {
                                     toast("نوشتن در فایل ممکن نشد. هایلایت‌ها داخل برنامه باقی ماندند.");
@@ -431,7 +447,7 @@ public class MainActivity extends Activity implements PdfView.Listener {
                     }
                 }).start();
             } else {
-                out.delete();
+                if (out != null) out.delete();
                 toast("ذخیره لغو شد؛ هایلایت‌ها داخل برنامه باقی ماندند.");
                 if (after != null) after.run();
             }
@@ -489,51 +505,92 @@ public class MainActivity extends Activity implements PdfView.Listener {
                     if (name == null) name = uri.getLastPathSegment();
                     if (name == null) name = "document.pdf";
 
-                    // کپی فایل به حافظه‌ی موقت برنامه تا PdfRenderer بتواند آن را بخواند
-                    File out = new File(getCacheDir(), "pdf_" + System.currentTimeMillis() + ".pdf");
-                    InputStream in = getContentResolver().openInputStream(uri);
-                    if (in == null) throw new IOException("no stream");
-                    FileOutputStream fos = new FileOutputStream(out);
+                    File out = null;
+                    long keySize = -1;
+                    List<HighlightStore.H> imported = null;
+                    boolean isDirect = false;
+
+                    // ۱) باز کردن مستقیم، بدون کپی کردن فایل (برای فایل‌های بزرگ چند دقیقه صرفه‌جویی می‌شود)
+                    ParcelFileDescriptor pfd = null;
                     try {
-                        byte[] buf = new byte[64 * 1024];
-                        int n;
-                        while ((n = in.read(buf)) > 0) {
-                            fos.write(buf, 0, n);
+                        pfd = getContentResolver().openFileDescriptor(uri, "r");
+                        long sz = (pfd != null) ? pfd.getStatSize() : -1;
+                        if (pfd != null && sz > 0) {
+                            boolean marker = false;
+                            ParcelFileDescriptor p2 = getContentResolver().openFileDescriptor(uri, "r");
+                            try {
+                                java.io.FileInputStream fi = new java.io.FileInputStream(p2.getFileDescriptor());
+                                marker = PdfInk.containsMarker(PdfInk.channelSource(fi.getChannel()), 16L * 1024 * 1024);
+                            } catch (Throwable ignored) {
+                            } finally {
+                                if (p2 != null) p2.close();
+                            }
+                            if (!marker || sz > 64L * 1024 * 1024) {
+                                r = new PdfRenderer(pfd);
+                                isDirect = true;
+                                keySize = sz;
+                            }
                         }
-                    } finally {
+                    } catch (Throwable t) {
+                        closeQuietly(r);
+                        r = null;
+                        isDirect = false;
+                    }
+                    if (!isDirect && pfd != null) {
                         try {
-                            in.close();
+                            pfd.close();
                         } catch (IOException ignored) {
                         }
-                        fos.close();
                     }
 
-                    // اگر این PDF قبلاً با همین برنامه هایلایت شده، هایلایت‌ها را برمی‌داریم و به‌صورت
-                    // قابل‌ویرایش وارد برنامه می‌کنیم؛ صفحه‌ها از نسخه‌ی تمیز رسم می‌شوند.
-                    long keySize = out.length();
-                    List<HighlightStore.H> imported = null;
-                    if (PdfExporter.containsMarker(out)) {
+                    // ۲) راه جایگزین: کپی به حافظه‌ی موقت (فایل‌های غیرقابل‌پیمایش، یا فایل کوچکی که هایلایت‌های قبلی دارد)
+                    if (r == null) {
+                        out = new File(getCacheDir(), "pdf_" + System.currentTimeMillis() + ".pdf");
+                        InputStream in = getContentResolver().openInputStream(uri);
+                        if (in == null) throw new IOException("no stream");
+                        FileOutputStream fos = new FileOutputStream(out);
                         try {
-                            File stripped = new File(getCacheDir(), "pdf_s_" + System.currentTimeMillis() + ".pdf");
-                            List<HighlightStore.H> list = new java.util.ArrayList<>();
-                            if (PdfExporter.stripAndImport(getApplicationContext(), out, stripped, list)) {
-                                out.delete();
-                                out = stripped;
-                                imported = list;
-                            } else {
-                                stripped.delete();
+                            byte[] buf = new byte[256 * 1024];
+                            int n;
+                            while ((n = in.read(buf)) > 0) {
+                                fos.write(buf, 0, n);
                             }
-                        } catch (Throwable ignored) {
+                        } finally {
+                            try {
+                                in.close();
+                            } catch (IOException ignored) {
+                            }
+                            fos.close();
                         }
+
+                        // اگر این PDF قبلاً با همین برنامه هایلایت شده، هایلایت‌ها را برمی‌داریم و به‌صورت
+                        // قابل‌ویرایش وارد برنامه می‌کنیم؛ صفحه‌ها از نسخه‌ی تمیز رسم می‌شوند.
+                        keySize = out.length();
+                        if (PdfExporter.containsMarker(out)) {
+                            try {
+                                File stripped = new File(getCacheDir(), "pdf_s_" + System.currentTimeMillis() + ".pdf");
+                                List<HighlightStore.H> list = new ArrayList<>();
+                                if (PdfExporter.stripAndImport(getApplicationContext(), out, stripped, list)) {
+                                    out.delete();
+                                    out = stripped;
+                                    imported = list;
+                                } else {
+                                    stripped.delete();
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                        ParcelFileDescriptor pf2 = ParcelFileDescriptor.open(out, ParcelFileDescriptor.MODE_READ_ONLY);
+                        r = new PdfRenderer(pf2);
                     }
 
-                    ParcelFileDescriptor pfd = ParcelFileDescriptor.open(out, ParcelFileDescriptor.MODE_READ_ONLY);
-                    r = new PdfRenderer(pfd);
                     final int count = r.getPageCount();
                     if (count <= 0) throw new IOException("empty");
+                    // فایل‌های پرصفحه: اندازه‌ی فقط صفحه‌ی اول خوانده می‌شود، بقیه هنگام نمایش اصلاح می‌شوند
+                    final boolean eager = count <= 40;
                     final float[] w = new float[count];
                     final float[] h = new float[count];
-                    for (int i = 0; i < count; i++) {
+                    for (int i = 0; i < (eager ? count : 1); i++) {
                         PdfRenderer.Page p = r.openPage(i);
                         try {
                             w[i] = Math.max(1, p.getWidth());
@@ -542,6 +599,14 @@ public class MainActivity extends Activity implements PdfView.Listener {
                             p.close();
                         }
                     }
+                    if (!eager) {
+                        for (int i = 1; i < count; i++) {
+                            w[i] = w[0];
+                            h[i] = h[0];
+                        }
+                    }
+                    final boolean fDirect = isDirect;
+                    final boolean fEager = eager;
                     final PdfRenderer fr = r;
                     final String fname = name;
                     final File ffile = out;
@@ -550,7 +615,7 @@ public class MainActivity extends Activity implements PdfView.Listener {
                     runOnUiThread(new Runnable() {
                         @Override
                         public void run() {
-                            onLoaded(uri, fname, ffile, fr, w, h, fKeySize, fImported);
+                            onLoaded(uri, fname, ffile, fr, w, h, fKeySize, fImported, fDirect, fEager);
                         }
                     });
                 } catch (SecurityException e) {
@@ -565,20 +630,34 @@ public class MainActivity extends Activity implements PdfView.Listener {
     }
 
     private void onLoaded(Uri uri, String name, File file, PdfRenderer r, float[] w, float[] h,
-                          long keySize, List<HighlightStore.H> imported) {
+                          long keySize, List<HighlightStore.H> imported, boolean isDirect, boolean allKnown) {
         saveScrollPos();
         docKey = "doc_" + name + "_" + keySize;
         store = new HighlightStore(this, docKey);
         boolean wasEmpty = store.all().isEmpty();
         if (imported != null && wasEmpty) store.addAll(imported);   // هایلایت‌های داخل خود فایل
         // اگر چیزی تغییر نکرده، دیگر لازم نیست دوباره ذخیره شود
-        savedMod = (store.all().isEmpty() || (imported != null && wasEmpty)) ? store.modCount() : -1;
+        boolean unsaved = false;
+        for (HighlightStore.H hh : store.all()) {
+            if (!hh.baked) {
+                unsaved = true;
+                break;
+            }
+        }
+        if (isDirect) {
+            savedMod = unsaved ? -1 : store.modCount();
+        } else {
+            for (HighlightStore.H hh : store.all()) hh.baked = false;   // در حالت کپی همه‌چیز از نو نوشته می‌شود
+            savedMod = (store.all().isEmpty() || (imported != null && wasEmpty)) ? store.modCount() : -1;
+        }
+        direct = isDirect;
+        directLen = keySize;
         pageCount = w.length;
         currentUri = uri;
         currentName = name;
         int start = Math.max(0, Math.min(prefs.getInt("pos_" + docKey, 0), pageCount - 1));
 
-        pdfView.setDocument(r, w, h, store, start);   // فایل قبلی را خودش می‌بندد
+        pdfView.setDocument(r, w, h, allKnown, store, start);   // فایل قبلی را خودش می‌بندد
         if (currentFile != null) currentFile.delete();
         currentFile = file;
 
@@ -603,6 +682,7 @@ public class MainActivity extends Activity implements PdfView.Listener {
             currentFile = null;
         }
         store = null;
+        direct = false;
         docKey = null;
         currentUri = null;
         currentName = null;
@@ -641,6 +721,10 @@ public class MainActivity extends Activity implements PdfView.Listener {
         toast("در حال ذخیره در فایل PDF…");
         final File src = currentFile;
         final Uri dest = currentUri;
+        if (direct) {
+            saveDirect(after, mod, strokes, dest);
+            return;
+        }
         new Thread(new Runnable() {
             @Override
             public void run() {
@@ -682,6 +766,126 @@ public class MainActivity extends Activity implements PdfView.Listener {
                 });
             }
         }).start();
+    }
+
+    /** حالت مستقیم: فقط بخش تازه به انتهای خود فایل اصلی افزوده می‌شود؛ فایل بزرگ کپی یا بازنویسی نمی‌شود. */
+    private void saveDirect(final Runnable after, final int mod, List<HighlightStore.H> all, final Uri dest) {
+        final List<HighlightStore.H> todo = new ArrayList<>();
+        for (HighlightStore.H h : all) {
+            if (!h.baked) todo.add(h);
+        }
+        if (todo.isEmpty() || dest == null) {
+            saving = false;
+            savedMod = mod;
+            if (after != null) after.run();
+            else toast("تغییر جدیدی برای ذخیره نیست");
+            return;
+        }
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                byte[] tail;
+                long oldLen;
+                try {
+                    ParcelFileDescriptor rp = getContentResolver().openFileDescriptor(dest, "r");
+                    try {
+                        java.nio.channels.FileChannel ch = new java.io.FileInputStream(rp.getFileDescriptor()).getChannel();
+                        oldLen = ch.size();
+                        tail = PdfExporter.buildTail(PdfInk.channelSource(ch), todo);
+                    } finally {
+                        rp.close();
+                    }
+                } catch (final Throwable t) {
+                    final String err = PdfExporter.describe(t);
+                    runOnUiThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            saving = false;
+                            showSaveError(err);
+                            if (after != null) after.run();
+                        }
+                    });
+                    return;
+                }
+                boolean wrote = false;
+                ParcelFileDescriptor wp = null;
+                java.nio.channels.FileChannel wc = null;
+                try {
+                    wp = getContentResolver().openFileDescriptor(dest, "rw");
+                    java.io.FileOutputStream fos = new java.io.FileOutputStream(wp.getFileDescriptor());
+                    wc = fos.getChannel();
+                    if (wc.size() != oldLen) throw new IOException("size changed");
+                    wc.position(oldLen);
+                    java.nio.ByteBuffer bb = java.nio.ByteBuffer.wrap(tail);
+                    while (bb.hasRemaining()) wc.write(bb);
+                    try {
+                        fos.getFD().sync();
+                    } catch (Throwable ignored) {
+                    }
+                    wrote = true;
+                } catch (Throwable t) {
+                    try {
+                        if (wc != null) wc.truncate(oldLen);
+                    } catch (Throwable ignored) {
+                    }
+                } finally {
+                    try {
+                        if (wp != null) wp.close();
+                    } catch (IOException ignored) {
+                    }
+                }
+                final boolean ok = wrote;
+                final byte[] ftail = tail;
+                final long fOld = oldLen;
+                runOnUiThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        saving = false;
+                        if (ok) {
+                            if (store != null) store.markBaked(todo);
+                            savedMod = mod;
+                            directLen = fOld + ftail.length;
+                            afterSaved(dest, fOld + ftail.length, after);
+                        } else {
+                            pendingTail = ftail;
+                            pendingTodo = todo;
+                            pendingAfter = after;
+                            pendingMod = mod;
+                            pendingSize = fOld + ftail.length;
+                            startSaveAs();
+                        }
+                    }
+                });
+            }
+        }).start();
+    }
+
+    /** نسخه‌ی جدید: اصل فایل + بخش افزوده‌شده را در مقصد می‌نویسد. */
+    private boolean copyDirectToUri(Uri srcUri, byte[] tail, Uri dest) {
+        InputStream in = null;
+        OutputStream os = null;
+        try {
+            in = getContentResolver().openInputStream(srcUri);
+            os = getContentResolver().openOutputStream(dest, "wt");
+            if (in == null || os == null) return false;
+            byte[] buf = new byte[256 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+            os.write(tail);
+            os.flush();
+            return true;
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            try {
+                if (in != null) in.close();
+            } catch (IOException ignored) {
+            }
+            try {
+                if (os != null) os.close();
+            } catch (IOException ignored) {
+            }
+        }
     }
 
     private void showSaveError(String err) {

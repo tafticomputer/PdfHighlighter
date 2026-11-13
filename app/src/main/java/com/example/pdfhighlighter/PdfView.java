@@ -67,6 +67,9 @@ public class PdfView extends View {
     private float[] pw = new float[0];
     private float[] ph = new float[0];
     private int count;
+    private boolean[] known;   // null = اندازه‌ی همه‌ی صفحه‌ها معلوم است؛ وگرنه تا اولین رسم صفحه حدسی است
+    private volatile float baseScale = 1.0f;
+    private float emaMs;
     private HighlightStore store;
     private volatile int docGen;
 
@@ -218,6 +221,11 @@ public class PdfView extends View {
     }
 
     public void setDocument(PdfRenderer r, float[] w, float[] h, HighlightStore s, int startPage) {
+        setDocument(r, w, h, true, s, startPage);
+    }
+
+    /** allKnown=false: اندازه‌ی صفحه‌ها فقط حدسی است و هنگام رسم هر صفحه اصلاح می‌شود (برای فایل‌های بزرگ). */
+    public void setDocument(PdfRenderer r, float[] w, float[] h, boolean allKnown, HighlightStore s, int startPage) {
         closeDocument();
         docGen++;
         synchronized (lock) {
@@ -226,6 +234,10 @@ public class PdfView extends View {
         pw = w;
         ph = h;
         count = w.length;
+        known = allKnown ? null : new boolean[count];
+        if (known != null && count > 0) known[0] = true;
+        emaMs = 0;
+        baseScale = 1.0f;
         store = s;
         zoom = 1f;
         offX = 0;
@@ -256,6 +268,7 @@ public class PdfView extends View {
         pending.clear();
         detailLatest.clear();
         count = 0;
+        known = null;
         pw = new float[0];
         ph = new float[0];
         h1 = new float[0];
@@ -327,6 +340,21 @@ public class PdfView extends View {
         if (keepPos && total1 > 0) frac = offY / (total1 * zoom);
         float xScale = (layoutW > 0) ? viewW / (float) layoutW : 1f;
 
+        computeSizes();
+        layoutW = viewW;
+        if (keepPos) {
+            offY = frac * total1 * zoom;
+            offX = offX * xScale;
+            baseCache.evictAll();
+            pending.clear();
+            details.clear();
+            detailLatest.clear();
+        }
+        clampOffsets();
+        scheduleDetail();
+    }
+
+    private void computeSizes() {
         top1 = new float[count + 1];
         h1 = new float[count];
         float gap = dp(6);
@@ -338,16 +366,23 @@ public class PdfView extends View {
         }
         top1[count] = y;
         total1 = Math.max(1f, y - gap);
-        layoutW = viewW;
-        if (keepPos) {
-            offY = frac * total1 * zoom;
-            offX = offX * xScale;
-            baseCache.evictAll();
-            pending.clear();
-            details.clear();
-            detailLatest.clear();
-        }
+    }
+
+    /** اندازه‌ی واقعی صفحه‌ی i فهمیده شد (روی نخ اصلی)؛ جای صفحه‌ی در حال دیدن ثابت می‌ماند. */
+    private void learnSize(int i, float w, float h, int gen) {
+        if (gen != docGen || known == null || i < 0 || i >= count || known[i] || w < 1 || h < 1) return;
+        known[i] = true;
+        if (Math.abs(pw[i] - w) < 0.5f && Math.abs(ph[i] - h) < 0.5f) return;
+        float z = zoom;
+        int anchor = pageAt(offY / z);
+        float within = (offY / z - top1[anchor]) / Math.max(1f, h1[anchor]);
+        pw[i] = w;
+        ph[i] = h;
+        computeSizes();
+        offY = (top1[anchor] + within * h1[anchor]) * z;
         clampOffsets();
+        details.remove(i);
+        invalidate();
         scheduleDetail();
     }
 
@@ -508,7 +543,7 @@ public class PdfView extends View {
         final int gen = docGen;
         final float ptsW = pw[i];
         final float ptsH = ph[i];
-        final int bw0 = baseW;
+        final int bw0 = Math.min(Math.round(viewW * baseScale), 1200);
         exec.execute(new Runnable() {
             @Override
             public void run() {
@@ -527,19 +562,35 @@ public class PdfView extends View {
     }
 
     private Bitmap renderBase(int i, float ptsW, float ptsH, int bw, int gen) {
-        int bh = Math.max(1, Math.round(bw * ptsH / ptsW));
-        if (bh > MAX_TEX) {
-            bw = Math.max(1, Math.round(bw * (float) MAX_TEX / bh));
-            bh = MAX_TEX;
-        }
         synchronized (lock) {
             if (renderer == null || gen != docGen) return null;
             PdfRenderer.Page page = null;
             try {
+                long t0 = System.nanoTime();
                 page = renderer.openPage(i);
+                final int rw = Math.max(1, page.getWidth());
+                final int rh = Math.max(1, page.getHeight());
+                int bh = Math.max(1, Math.round(bw * (float) rh / rw));
+                if (bh > MAX_TEX) {
+                    bw = Math.max(1, Math.round(bw * (float) MAX_TEX / bh));
+                    bh = MAX_TEX;
+                }
                 Bitmap b = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888);
                 b.eraseColor(Color.WHITE);
                 page.render(b, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY);
+                float ms = (System.nanoTime() - t0) / 1e6f;
+                emaMs = emaMs == 0 ? ms : emaMs * 0.7f + ms * 0.3f;
+                if (emaMs > 900f) baseScale = 0.75f;          // دستگاه کند: کیفیت پایه کمی کمتر، سرعت بیشتر
+                else if (emaMs < 350f) baseScale = 1.0f;
+                if (known != null) {
+                    final int fi = i, fg = gen;
+                    post(new Runnable() {
+                        @Override
+                        public void run() {
+                            learnSize(fi, rw, rh, fg);
+                        }
+                    });
+                }
                 return b;
             } catch (Throwable t) {
                 return null;
@@ -585,6 +636,7 @@ public class PdfView extends View {
             float vy0 = Math.max(0f, offY - t);
             float vy1 = Math.min(h, offY + viewH - t);
             if (vx1 <= vx0 || vy1 <= vy0) continue;
+            if (known != null && !known[i]) continue;
             Detail d = details.get(i);
             if (d != null && Math.abs(d.zoom - z) < 0.005f * z
                     && d.x0 <= vx0 + 1 && d.y0 <= vy0 + 1

@@ -25,6 +25,7 @@ public class HighlightStore {
         public float width;   // ضخامت، به‌صورت کسری از عرض صفحه
         public float[] pts;   // x0,y0,x1,y1,... (null یعنی مستطیل نسخه‌ی قبلی)
         public float l, t, r, b; // فقط برای مستطیل نسخه‌ی قبلی
+        public boolean baked;    // قبلاً داخل خود فایل PDF نوشته شده (حالت فایل بزرگ)
     }
 
     private final SharedPreferences prefs;
@@ -51,6 +52,7 @@ public class HighlightStore {
                 H h = new H();
                 h.page = o.getInt("p");
                 h.color = o.getInt("c");
+                h.baked = o.optInt("k", 0) == 1;
                 if (o.has("pts")) {
                     JSONArray pa = o.getJSONArray("pts");
                     int n = pa.length() - (pa.length() % 2);
@@ -77,6 +79,12 @@ public class HighlightStore {
     private void save() {
         mod++;
         prefs.edit().putString(key, toJson()).apply();
+    }
+
+    /** این موردها داخل فایل نوشته شده‌اند؛ تغییر محسوب نمی‌شود (modCount زیاد نمی‌شود). */
+    public void markBaked(List<H> list) {
+        for (H h : list) h.baked = true;
+        flush();
     }
 
     /** شماره‌ای که با هر تغییر (افزودن، پاک‌کردن، برگشت) زیاد می‌شود. */
@@ -110,6 +118,7 @@ public class HighlightStore {
                 JSONObject o = new JSONObject();
                 o.put("p", h.page);
                 o.put("c", h.color);
+                if (h.baked) o.put("k", 1);
                 if (h.pts != null) {
                     o.put("w", r4(h.width));
                     JSONArray pa = new JSONArray();

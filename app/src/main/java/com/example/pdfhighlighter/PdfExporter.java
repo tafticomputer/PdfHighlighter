@@ -35,6 +35,28 @@ public final class PdfExporter {
         PdfInk.embed(src, out, list);
     }
 
+    private static List<PdfInk.Stroke> conv(List<HighlightStore.H> strokes) {
+        List<PdfInk.Stroke> list = new ArrayList<>();
+        for (HighlightStore.H h : strokes) {
+            PdfInk.Stroke s = new PdfInk.Stroke();
+            s.page = h.page;
+            s.argb = h.color;
+            s.width = h.width;
+            s.pts = h.pts;
+            s.l = h.l;
+            s.t = h.t;
+            s.r = h.r;
+            s.b = h.b;
+            list.add(s);
+        }
+        return list;
+    }
+
+    /** فقط بخش افزوده‌ی انتهای فایل (برای فایل‌های بزرگ؛ بدون خواندن کل فایل). */
+    public static byte[] buildTail(PdfInk.Source src, List<HighlightStore.H> strokes) throws IOException {
+        return PdfInk.buildEmbed(src, conv(strokes));
+    }
+
     /** آیا این فایل هایلایتِ ساخته‌شده با همین برنامه دارد؟ */
     public static boolean containsMarker(File f) {
         return PdfInk.containsMarker(f);

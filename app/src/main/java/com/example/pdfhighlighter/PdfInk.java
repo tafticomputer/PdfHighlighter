@@ -5,9 +5,13 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Iterator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -38,26 +42,122 @@ public final class PdfInk {
         public float l, t, r, b; // فقط برای مستطیل قدیمی
     }
 
-    public static void embed(File src, File out, List<Stroke> strokes) throws IOException {
-        byte[] data = readAll(src);
-        new PdfInk(data).run(src, out, strokes);
+
+    // ---------------------------------------------------------------- منبع داده (خواندن تصادفی، بدون بارگذاری کل فایل)
+
+    public interface Source {
+        long length() throws IOException;
+
+        /** تا len بایت از آفست pos می‌خواند؛ تعداد خوانده‌شده یا -1 در پایان فایل. */
+        int read(long pos, byte[] buf, int off, int len) throws IOException;
+
+        void close();
     }
 
+    public static Source fileSource(File f) throws IOException {
+        final RandomAccessFile raf = new RandomAccessFile(f, "r");
+        return new Source() {
+            public long length() throws IOException {
+                return raf.length();
+            }
+
+            public synchronized int read(long pos, byte[] buf, int off, int len) throws IOException {
+                raf.seek(pos);
+                return raf.read(buf, off, len);
+            }
+
+            public void close() {
+                try {
+                    raf.close();
+                } catch (IOException ignored) {
+                }
+            }
+        };
+    }
+
+    /** کانال را نمی‌بندد (مالک آن بیرون است). */
+    public static Source channelSource(final FileChannel ch) {
+        return new Source() {
+            public long length() throws IOException {
+                return ch.size();
+            }
+
+            public synchronized int read(long pos, byte[] buf, int off, int len) throws IOException {
+                return ch.read(ByteBuffer.wrap(buf, off, len), pos);
+            }
+
+            public void close() {
+            }
+        };
+    }
+
+    /** فقط بخشِ افزوده‌شده‌ی انتهای فایل را می‌سازد (اصل فایل را بازنویسی نمی‌کند). */
+    public static byte[] buildEmbed(Source s, List<Stroke> strokes) throws IOException {
+        return new PdfInk(s).run(strokes);
+    }
+
+    /** بخش افزوده‌ی «حذف حاشیه‌نویسی‌های خودمان»؛ اگر چیزی نبود null. هایلایت‌های یافت‌شده در imported ریخته می‌شود. */
+    public static byte[] buildStrip(Source s, List<Stroke> imported) throws IOException {
+        return new PdfInk(s).runStrip(imported);
+    }
+
+    private static void copyPlus(File src, File out, byte[] tail) throws IOException {
+        FileOutputStream fos = new FileOutputStream(out);
+        try {
+            FileInputStream in = new FileInputStream(src);
+            try {
+                byte[] buf = new byte[256 * 1024];
+                int n;
+                while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
+            } finally {
+                in.close();
+            }
+            fos.write(tail);
+        } finally {
+            fos.close();
+        }
+    }
+
+    public static void embed(File src, File out, List<Stroke> strokes) throws IOException {
+        Source s = fileSource(src);
+        byte[] tail;
+        try {
+            tail = buildEmbed(s, strokes);
+        } finally {
+            s.close();
+        }
+        copyPlus(src, out, tail);
+    }
 
     /** نشانه‌ی حاشیه‌نویسی‌های ساخته‌شده با این برنامه (برای شناسایی، وارد کردن دوباره و حذف). */
     public static final String MARKER = "(pdfhl1)";
 
     /** آیا در این فایل حاشیه‌نویسی ساخته‌شده با این برنامه هست؟ (جستجوی سریع، بدون تحلیل فایل) */
     public static boolean containsMarker(File f) {
-        byte[] pat = ("/NM " + MARKER).getBytes(ISO);
-        FileInputStream in = null;
+        Source s = null;
         try {
-            in = new FileInputStream(f);
+            s = fileSource(f);
+            return containsMarker(s, Long.MAX_VALUE);
+        } catch (IOException e) {
+            return false;
+        } finally {
+            if (s != null) s.close();
+        }
+    }
+
+    /** جستجو فقط در maxTail بایتِ آخر (حاشیه‌نویسی‌های ما همیشه به انتهای فایل افزوده می‌شوند). */
+    public static boolean containsMarker(Source s, long maxTail) {
+        try {
+            byte[] pat = ("/NM " + MARKER).getBytes(ISO);
+            long len = s.length();
+            long pos = Math.max(0, len - Math.max(0, maxTail));
             byte[] buf = new byte[256 * 1024 + pat.length];
             int keep = 0;
-            while (true) {
-                int n = in.read(buf, keep, buf.length - keep);
-                if (n < 0) return false;
+            while (pos < len) {
+                int want = (int) Math.min(buf.length - keep, len - pos);
+                int n = s.read(pos, buf, keep, want);
+                if (n <= 0) return false;
+                pos += n;
                 int total = keep + n;
                 for (int i = 0; i + pat.length <= total; i++) {
                     int k = 0;
@@ -69,12 +169,8 @@ public final class PdfInk {
             }
         } catch (IOException e) {
             return false;
-        } finally {
-            try {
-                if (in != null) in.close();
-            } catch (IOException ignored) {
-            }
         }
+        return false;
     }
 
     /**
@@ -82,8 +178,16 @@ public final class PdfInk {
      * خروجی out همان فایل است بدون آن حاشیه‌نویسی‌ها. اگر چیزی پیدا نشد false برمی‌گردد و out ساخته نمی‌شود.
      */
     public static boolean strip(File src, File out, List<Stroke> imported) throws IOException {
-        byte[] data = readAll(src);
-        return new PdfInk(data).runStrip(src, out, imported);
+        Source s = fileSource(src);
+        byte[] tail;
+        try {
+            tail = buildStrip(s, imported);
+        } finally {
+            s.close();
+        }
+        if (tail == null) return false;
+        copyPlus(src, out, tail);
+        return true;
     }
 
     // ================================================================== مدل مقدارها
@@ -127,9 +231,9 @@ public final class PdfInk {
 
     private static final class Stream {
         final Dict dict;
-        final int start;
+        final long start;
 
-        Stream(Dict d, int s) {
+        Stream(Dict d, long s) {
             dict = d;
             start = s;
         }
@@ -356,58 +460,117 @@ public final class PdfInk {
 
     // ================================================================== وضعیت سند
 
-    private final byte[] data;
+    private final Source src;
+    private final long len;
     private final Map<Integer, XEntry> xref = new HashMap<>();
     private final Map<Integer, Object> cache = new HashMap<>();
-    private final Map<Integer, ObjStm> objStms = new HashMap<>();
+    private final Map<Integer, ObjStm> objStms = new LinkedHashMap<Integer, ObjStm>(8, 0.75f, true) {
+        protected boolean removeEldestEntry(Map.Entry<Integer, ObjStm> e) {
+            return size() > 6;
+        }
+    };
     private final List<PageInfo> pages = new ArrayList<>();
+    private final Map<Integer, PageInfo> pageCache = new HashMap<>();
+    private Ref pagesRoot;
+    private int total = -1;
+    private boolean fullPages;
     private Dict trailer;
     private boolean xrefIsStream;
     private long startXref;
 
-    private PdfInk(byte[] data) {
-        this.data = data;
-    }
+    private static final int MAX_WIN = 32 * 1024 * 1024;
+    private static final int MAX_DECODE = 64 * 1024 * 1024;
 
-    private static byte[] readAll(File f) throws IOException {
-        long len = f.length();
-        if (len > Integer.MAX_VALUE - 1024) throw new IOException("فایل خیلی بزرگ است");
-        byte[] b = new byte[(int) len];
-        FileInputStream in = new FileInputStream(f);
-        try {
-            int off = 0;
-            while (off < b.length) {
-                int n = in.read(b, off, b.length - off);
-                if (n < 0) break;
-                off += n;
-            }
-            if (off != b.length) throw new IOException("خواندن ناقص فایل");
-        } finally {
-            in.close();
+    private static final class Fatal extends IOException {
+        Fatal(String m) {
+            super(m);
         }
-        return b;
     }
 
-    private int indexOf(String s, int from) {
+    private interface Fn<T> {
+        T run(byte[] w, boolean truncated) throws IOException;
+    }
+
+    private PdfInk(Source src) throws IOException {
+        this.src = src;
+        this.len = src.length();
+    }
+
+    /** تا n بایت از pos (کمتر در پایان فایل). */
+    private byte[] readAt(long pos, int n) throws IOException {
+        if (pos < 0) pos = 0;
+        n = (int) Math.max(0, Math.min((long) n, len - pos));
+        byte[] b = new byte[n];
+        int got = fill(pos, b, n);
+        return got == n ? b : Arrays.copyOf(b, got);
+    }
+
+    private int fill(long pos, byte[] b, int n) throws IOException {
+        int got = 0;
+        while (got < n) {
+            int r = src.read(pos + got, b, got, n - got);
+            if (r <= 0) break;
+            got += r;
+        }
+        return got;
+    }
+
+    /** fn را روی پنجره‌ای از فایل اجرا می‌کند؛ اگر پنجره کوتاه بود، بزرگ‌تر (×۴) تکرار می‌کند. */
+    private <T> T atWindow(long off, Fn<T> fn) throws IOException {
+        int size = 64 * 1024;
+        while (true) {
+            byte[] w = readAt(off, size);
+            boolean trunc = off + w.length < len;
+            try {
+                return fn.run(w, trunc);
+            } catch (Fatal e) {
+                throw e;
+            } catch (IOException | RuntimeException e) {
+                if (!trunc || size >= MAX_WIN) {
+                    if (e instanceof IOException) throw (IOException) e;
+                    throw new IOException(e.toString());
+                }
+                size = Math.min(MAX_WIN, size * 4);
+            }
+        }
+    }
+
+    private boolean needNl() throws IOException {
+        if (len <= 0) return false;
+        int c = readAt(len - 1, 1)[0];
+        return c != 10 && c != 13;
+    }
+
+    private static int lastIdx(byte[] b, String s) {
         byte[] pat = s.getBytes(ISO);
         outer:
-        for (int i = Math.max(0, from); i <= data.length - pat.length; i++) {
+        for (int i = b.length - pat.length; i >= 0; i--) {
             for (int k = 0; k < pat.length; k++) {
-                if (data[i + k] != pat[k]) continue outer;
+                if (b[i + k] != pat[k]) continue outer;
             }
             return i;
         }
         return -1;
     }
 
-    private int lastIndexOf(String s, int from) {
-        byte[] pat = s.getBytes(ISO);
-        outer:
-        for (int i = data.length - pat.length; i >= Math.max(0, from); i--) {
-            for (int k = 0; k < pat.length; k++) {
-                if (data[i + k] != pat[k]) continue outer;
+    /** اولین رخداد pat از آفست from (جستجوی تکه‌تکه)؛ -1 اگر نبود. */
+    private long scanFor(String pat, long from) throws IOException {
+        byte[] p = pat.getBytes(ISO);
+        byte[] buf = new byte[1024 * 1024 + p.length];
+        long pos = Math.max(0, from);
+        while (pos < len) {
+            int n = (int) Math.min(buf.length, len - pos);
+            int got = fill(pos, buf, n);
+            if (got < p.length) return -1;
+            outer:
+            for (int i = 0; i + p.length <= got; i++) {
+                for (int k = 0; k < p.length; k++) {
+                    if (buf[i + k] != p[k]) continue outer;
+                }
+                return pos + i;
             }
-            return i;
+            if (pos + got >= len) return -1;
+            pos += got - (p.length - 1);
         }
         return -1;
     }
@@ -442,44 +605,61 @@ public final class PdfInk {
 
     // ================================================================== xref
 
+    private static final class XT {
+        Dict tr;
+        final List<long[]> ents = new ArrayList<>();
+    }
+
     private void readXref() throws IOException {
-        int idx = lastIndexOf("startxref", data.length - 4096);
-        if (idx < 0) idx = lastIndexOf("startxref", 0);
+        int tailN = (int) Math.min(len, 256 * 1024);
+        byte[] tail = readAt(len - tailN, tailN);
+        int idx = lastIdx(tail, "startxref");
         if (idx < 0) throw new IOException("startxref پیدا نشد");
-        Parser sp = new Parser(data, idx + 9);
+        Parser sp = new Parser(tail, idx + 9);
         startXref = Long.parseLong(sp.token());
 
         long off = startXref;
         Set<Long> seen = new HashSet<>();
         boolean first = true;
         while (off >= 0 && seen.add(off)) {
-            if (off >= data.length) throw new IOException("آفست xref نامعتبر");
-            Parser q = new Parser(data, (int) off);
-            q.skipWs();
+            if (off >= len) throw new IOException("آفست xref نامعتبر");
+            byte[] pk = readAt(off, 32);
+            Parser pp = new Parser(pk, 0);
+            pp.skipWs();
             Dict tr;
-            if (q.starts("xref")) {
-                q.p += 4;
-                while (true) {
+            if (pp.starts("xref")) {
+                XT xt = atWindow(off, (w, trunc) -> {
+                    XT r = new XT();
+                    Parser q = new Parser(w, 0);
                     q.skipWs();
-                    if (q.starts("trailer")) {
-                        q.p += 7;
-                        break;
-                    }
-                    int start = q.readInt();
-                    int cnt = q.readInt();
-                    for (int i = 0; i < cnt; i++) {
-                        long o = Long.parseLong(q.token());
-                        int g = Integer.parseInt(q.token());
-                        String t = q.token();
-                        int num = start + i;
-                        if (!xref.containsKey(num)) {
-                            xref.put(num, t.equals("n") ? new XEntry(1, o, g) : new XEntry(0, 0, g));
+                    q.p += 4;
+                    while (true) {
+                        q.skipWs();
+                        if (q.starts("trailer")) {
+                            q.p += 7;
+                            break;
+                        }
+                        int start = q.readInt();
+                        int cnt = q.readInt();
+                        for (int i = 0; i < cnt; i++) {
+                            long o = Long.parseLong(q.token());
+                            int g = Integer.parseInt(q.token());
+                            String t = q.token();
+                            boolean used = t.equals("n");
+                            r.ents.add(new long[]{start + i, used ? 1 : 0, used ? o : 0, g});
                         }
                     }
+                    Object t = q.parseValue();
+                    if (!(t instanceof Dict)) throw new Fatal("trailer نامعتبر");
+                    if (trunc && q.p > w.length - 32) throw new IOException("پنجره کوتاه است");
+                    r.tr = (Dict) t;
+                    return r;
+                });
+                for (long[] e : xt.ents) {
+                    int num = (int) e[0];
+                    if (!xref.containsKey(num)) xref.put(num, new XEntry((int) e[1], e[2], (int) e[3]));
                 }
-                Object t = q.parseValue();
-                if (!(t instanceof Dict)) throw new IOException("trailer نامعتبر");
-                tr = (Dict) t;
+                tr = xt.tr;
                 if (first) xrefIsStream = false;
                 Object xs = tr.get("XRefStm");
                 if (xs instanceof Raw) readXrefStreamAt(longOf(xs, -1));
@@ -542,25 +722,29 @@ public final class PdfInk {
 
     // ================================================================== خواندن شیءها
 
-    private Object readObjectAt(long off, int expect) throws IOException {
-        if (off < 0 || off >= data.length) throw new IOException("آفست شیء نامعتبر");
-        Parser ps = new Parser(data, (int) off);
-        int num = ps.readInt();
-        ps.readInt();
-        String kw = ps.token();
-        if (!kw.equals("obj")) throw new IOException("obj پیدا نشد در " + off);
-        if (expect >= 0 && num != expect) throw new IOException("شماره‌ی شیء نمی‌خواند");
-        Object v = ps.parseValue();
-        if (v instanceof Dict) {
-            ps.skipWs();
-            if (ps.starts("stream")) {
-                int s = ps.p + 6;
-                if (s < data.length && data[s] == 13) s++;
-                if (s < data.length && data[s] == 10) s++;
-                return new Stream((Dict) v, s);
+    private Object readObjectAt(final long off, final int expect) throws IOException {
+        if (off < 0 || off >= len) throw new Fatal("آفست شیء نامعتبر");
+        return atWindow(off, (w, trunc) -> {
+            Parser ps = new Parser(w, 0);
+            int num = ps.readInt();
+            ps.readInt();
+            String kw = ps.token();
+            if (!kw.equals("obj")) throw new Fatal("obj پیدا نشد در " + off);
+            if (expect >= 0 && num != expect) throw new Fatal("شماره‌ی شیء نمی‌خواند");
+            Object v = ps.parseValue();
+            if (v instanceof Dict) {
+                ps.skipWs();
+                if (ps.starts("stream")) {
+                    int s = ps.p + 6;
+                    if (s < w.length && w[s] == 13) s++;
+                    if (s < w.length && w[s] == 10) s++;
+                    if (trunc && s > w.length - 8) throw new IOException("پنجره کوتاه است");
+                    return new Stream((Dict) v, off + s);
+                }
             }
-        }
-        return v;
+            if (trunc && ps.p > w.length - 32) throw new IOException("پنجره کوتاه است");
+            return v;
+        });
     }
 
     private Object getObj(int num) throws IOException {
@@ -604,32 +788,37 @@ public final class PdfInk {
     }
 
     private int streamLength(Stream s) throws IOException {
-        int len = -1;
+        long l0 = -1;
         Object l = s.dict.get("Length");
         if (l instanceof Raw) {
-            len = intOf(l, -1);
+            l0 = longOf(l, -1);
         } else if (l instanceof Ref) {
             try {
-                len = intOf(getObj(((Ref) l).num), -1);
+                l0 = longOf(getObj(((Ref) l).num), -1);
             } catch (IOException ignored) {
-                len = -1;
+                l0 = -1;
             }
         }
-        if (len >= 0 && (long) s.start + len <= data.length) {
-            Parser ps = new Parser(data, s.start + len);
+        if (l0 >= 0 && s.start + l0 <= len) {
+            Parser ps = new Parser(readAt(s.start + l0, 32), 0);
             ps.skipWs();
-            if (ps.starts("endstream")) return len;
+            if (ps.starts("endstream")) {
+                if (l0 > Integer.MAX_VALUE) throw new IOException("جریان خیلی بزرگ است");
+                return (int) l0;
+            }
         }
-        int e = indexOf("endstream", s.start);
+        long e = scanFor("endstream", s.start);
         if (e < 0) throw new IOException("endstream پیدا نشد");
-        int end = e;
-        if (end > s.start && data[end - 1] == 10) end--;
-        if (end > s.start && data[end - 1] == 13) end--;
-        return end - s.start;
+        long end = e;
+        if (end > s.start && readAt(end - 1, 1)[0] == 10) end--;
+        if (end > s.start && readAt(end - 1, 1)[0] == 13) end--;
+        if (end - s.start > Integer.MAX_VALUE) throw new IOException("جریان خیلی بزرگ است");
+        return (int) (end - s.start);
     }
 
     private byte[] decode(Stream s) throws IOException {
-        int len = streamLength(s);
+        int n = streamLength(s);
+        if (n > MAX_DECODE) throw new IOException("جریان خیلی بزرگ است");
         Object f = resolve(s.dict.get("Filter"));
         if (f instanceof List) {
             List<?> l = (List<?>) f;
@@ -637,11 +826,13 @@ public final class PdfInk {
             else if (l.size() == 1) f = l.get(0);
             else throw new IOException("فیلتر چندگانه پشتیبانی نمی‌شود");
         }
-        if (f == null) return Arrays.copyOfRange(data, s.start, s.start + len);
+        byte[] rawIn = readAt(s.start, n);
+        if (rawIn.length != n) throw new IOException("خواندن ناقص جریان");
+        if (f == null) return rawIn;
         if (!(f instanceof Name) || !(((Name) f).s.equals("FlateDecode") || ((Name) f).s.equals("Fl"))) {
             throw new IOException("فیلتر پشتیبانی‌نشده");
         }
-        byte[] raw = inflate(data, s.start, len);
+        byte[] raw = inflate(rawIn, 0, n);
         Object parms = resolve(s.dict.containsKey("DecodeParms") ? s.dict.get("DecodeParms") : s.dict.get("DP"));
         if (parms instanceof List && ((List<?>) parms).size() == 1) parms = resolve(((List<?>) parms).get(0));
         if (parms instanceof Dict) {
@@ -752,6 +943,85 @@ public final class PdfInk {
         }
     }
 
+    private void preparePages() throws IOException {
+        Object root = resolve(trailer.get("Root"));
+        if (!(root instanceof Dict)) throw new IOException("Root نامعتبر");
+        Object pr = ((Dict) root).get("Pages");
+        if (!(pr instanceof Ref)) throw new IOException("Pages نامعتبر");
+        pagesRoot = (Ref) pr;
+        Object pd = getObj(pagesRoot.num);
+        total = (pd instanceof Dict) ? intOf(resolve(((Dict) pd).get("Count")), -1) : -1;
+        if (total <= 0) ensureFull();
+    }
+
+    private void ensureFull() throws IOException {
+        if (fullPages) return;
+        pages.clear();
+        buildPages();
+        fullPages = true;
+        total = pages.size();
+    }
+
+    /** صفحه‌ی idx را بدون پیمایش همه‌ی صفحه‌ها پیدا می‌کند (با /Count). */
+    private PageInfo pageInfo(int idx) throws IOException {
+        if (idx < 0 || (total >= 0 && idx >= total)) return null;
+        if (fullPages) return idx < pages.size() ? pages.get(idx) : null;
+        PageInfo pi = pageCache.get(idx);
+        if (pi != null) return pi;
+        try {
+            pi = findPage(pagesRoot, new Dict(), idx, 0);
+        } catch (IOException e) {
+            pi = null;
+        }
+        if (pi == null) {
+            ensureFull();
+            return idx < pages.size() ? pages.get(idx) : null;
+        }
+        pageCache.put(idx, pi);
+        return pi;
+    }
+
+    private PageInfo findPage(Ref r, Dict inh, int idx, int depth) throws IOException {
+        if (depth > 64) return null;
+        Object o = getObj(r.num);
+        if (!(o instanceof Dict)) return null;
+        Dict d = (Dict) o;
+        Dict ni = new Dict(inh);
+        String[] keys = {"Rotate", "CropBox", "MediaBox"};
+        for (String k : keys) {
+            if (d.containsKey(k)) ni.put(k, d.get(k));
+        }
+        Object kids = resolve(d.get("Kids"));
+        if (!(kids instanceof List)) {
+            if (idx != 0) return null;
+            PageInfo pi = new PageInfo();
+            pi.ref = r;
+            pi.dict = d;
+            pi.inh = ni;
+            return pi;
+        }
+        List<?> kl = (List<?>) kids;
+        int cnt = intOf(resolve(d.get("Count")), -1);
+        if (cnt == kl.size()) {            // درخت تخت: همه‌ی بچه‌ها برگ‌اند
+            if (idx >= kl.size()) return null;
+            Object k = kl.get(idx);
+            return (k instanceof Ref) ? findPage((Ref) k, ni, 0, depth + 1) : null;
+        }
+        for (Object k : kl) {
+            if (!(k instanceof Ref)) continue;
+            Object ko = getObj(((Ref) k).num);
+            if (!(ko instanceof Dict)) continue;
+            int c = 1;
+            if (((Dict) ko).containsKey("Kids")) {
+                c = intOf(resolve(((Dict) ko).get("Count")), -1);
+                if (c < 0) throw new IOException("Count ندارد");
+            }
+            if (idx < c) return findPage((Ref) k, ni, idx, depth + 1);
+            idx -= c;
+        }
+        return null;
+    }
+
     private double[] box(PageInfo pi) throws IOException {
         Object b = resolve(pi.inh.containsKey("CropBox") ? pi.inh.get("CropBox") : pi.inh.get("MediaBox"));
         if (b instanceof List && ((List<?>) b).size() >= 4) {
@@ -789,8 +1059,9 @@ public final class PdfInk {
         final long base;
         final TreeMap<Integer, long[]> offsets = new TreeMap<>();
 
-        Out(long base) {
+        Out(long base, boolean nl) {
             this.base = base;
+            if (nl) bo.write(10);
         }
 
         long pos() {
@@ -816,22 +1087,21 @@ public final class PdfInk {
         }
     }
 
-    private void run(File src, File outFile, List<Stroke> strokes) throws IOException {
+    private byte[] run(List<Stroke> strokes) throws IOException {
         readXref();
         if (trailer.containsKey("Encrypt")) throw new IOException("فایل رمزگذاری شده است");
-        buildPages();
-        if (pages.isEmpty()) throw new IOException("صفحه‌ای پیدا نشد");
+        preparePages();
+        if (total <= 0) throw new IOException("صفحه‌ای پیدا نشد");
 
         int size = intOf(trailer.get("Size"), 0);
         for (int k : xref.keySet()) size = Math.max(size, k + 1);
         int next = size;
 
-        boolean needNl = data.length > 0 && data[data.length - 1] != 10 && data[data.length - 1] != 13;
-        Out out = new Out(data.length + (needNl ? 1 : 0));
+        Out out = new Out(len, needNl());
 
         TreeMap<Integer, List<Stroke>> byPage = new TreeMap<>();
         for (Stroke s : strokes) {
-            if (s.page < 0 || s.page >= pages.size()) continue;
+            if (s.page < 0 || s.page >= total) continue;
             List<Stroke> l = byPage.get(s.page);
             if (l == null) {
                 l = new ArrayList<>();
@@ -842,7 +1112,8 @@ public final class PdfInk {
         if (byPage.isEmpty()) throw new IOException("چیزی برای نوشتن نیست");
 
         for (Map.Entry<Integer, List<Stroke>> pe : byPage.entrySet()) {
-            PageInfo pi = pages.get(pe.getKey());
+            PageInfo pi = pageInfo(pe.getKey());
+            if (pi == null) continue;
             double[] bx = box(pi);
             int rot = intOf(resolve(pi.inh.get("Rotate")), 0);
             rot = ((rot % 360) + 360) % 360;
@@ -957,11 +1228,10 @@ public final class PdfInk {
         }
         if (out.offsets.isEmpty()) throw new IOException("چیزی برای نوشتن نیست");
 
-        finish(out, next, src, outFile);
+        return finish(out, next);
     }
 
-    private void finish(Out out, int next, File src, File outFile) throws IOException {
-        boolean needNl = data.length > 0 && data[data.length - 1] != 10 && data[data.length - 1] != 13;
+    private byte[] finish(Out out, int next) throws IOException {
         StringBuilder tail = new StringBuilder();
         if (trailer.get("Root") != null) tail.append("/Root ").append(sers(trailer.get("Root")));
         if (trailer.get("Info") != null) tail.append(" /Info ").append(sers(trailer.get("Info")));
@@ -1015,22 +1285,7 @@ public final class PdfInk {
             out.str("\nendstream\nendobj\nstartxref\n" + xrefOff + "\n%%EOF\n");
         }
 
-        // ---- نوشتن فایل خروجی: اصل فایل + بخش افزوده‌شده
-        FileOutputStream fos = new FileOutputStream(outFile);
-        try {
-            FileInputStream in = new FileInputStream(src);
-            try {
-                byte[] buf = new byte[256 * 1024];
-                int n;
-                while ((n = in.read(buf)) > 0) fos.write(buf, 0, n);
-            } finally {
-                in.close();
-            }
-            if (needNl) fos.write(10);
-            out.bo.writeTo(fos);
-        } finally {
-            fos.close();
-        }
+        return out.bo.toByteArray();
     }
 
     private double num(Object o) throws IOException {
@@ -1118,14 +1373,13 @@ public final class PdfInk {
         return s;
     }
 
-    private boolean runStrip(File src, File outFile, List<Stroke> imported) throws IOException {
+    private byte[] runStrip(List<Stroke> imported) throws IOException {
         readXref();
         if (trailer.containsKey("Encrypt")) throw new IOException("فایل رمزگذاری شده است");
         buildPages();
         int size = intOf(trailer.get("Size"), 0);
         for (int k : xref.keySet()) size = Math.max(size, k + 1);
-        boolean needNl = data.length > 0 && data[data.length - 1] != 10 && data[data.length - 1] != 13;
-        Out out = new Out(data.length + (needNl ? 1 : 0));
+        Out out = new Out(len, needNl());
         boolean any = false;
         for (int i = 0; i < pages.size(); i++) {
             PageInfo pi = pages.get(i);
@@ -1153,9 +1407,8 @@ public final class PdfInk {
             out.str(sb.toString());
             out.end();
         }
-        if (!any) return false;
-        finish(out, size, src, outFile);
-        return true;
+        if (!any) return null;
+        return finish(out, size);
     }
 
     private static String sers(Object o) {
