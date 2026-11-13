@@ -1,8 +1,6 @@
 name: Build APK
 
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch:
 
 jobs:
@@ -10,6 +8,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Apply update zip (اگر فایل zip در مخزن باشد، پروژه از روی آن به‌روز می‌شود)
+        run: |
+          Z=$(ls -1 *.zip 2>/dev/null | sort | tail -n 1 || true)
+          if [ -n "$Z" ]; then
+            echo "Using $Z"
+            rm -rf /tmp/upd && mkdir /tmp/upd
+            unzip -q "$Z" -d /tmp/upd
+            ROOT=$(dirname "$(find /tmp/upd -name settings.gradle | head -n 1)")
+            [ -f "$ROOT/settings.gradle" ] || { echo "settings.gradle not found in zip"; exit 1; }
+            rm -rf app
+            cp -a "$ROOT"/. ./
+          else
+            echo "No zip found; building repository as is"
+          fi
 
       - uses: actions/setup-java@v4
         with:
